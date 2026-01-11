@@ -376,15 +376,18 @@ def generate_class_images(args, pipeline, accelerator):
     
     if cur_class_images < args.num_class_images:
         torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+        logger.info(f"⏳ Loading pipeline to device: {accelerator.device} with dtype: {torch_dtype}")
         pipeline = pipeline.to(accelerator.device, dtype=torch_dtype)
         pipeline.set_progress_bar_config(disable=True)
         
         num_new_images = args.num_class_images - cur_class_images
-        logger.info(f"Generating {num_new_images} class images for prior preservation...")
+        logger.info(f"📸 Need to generate {num_new_images} class images (already have {cur_class_images})")
+        logger.info(f"⏳ Generating with prompt: '{args.class_prompt}'")
         
         sample_dataset = PromptDataset(args.class_prompt, num_new_images)
         sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
         
+        generated_count = 0
         for example in tqdm(
             sample_dataloader, 
             desc="Generating class images",
@@ -396,10 +399,18 @@ def generate_class_images(args, pipeline, accelerator):
                 hash_image = hash(example["prompt"][i])
                 image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
                 image.save(image_filename)
+                generated_count += 1
+            
+            if generated_count % 20 == 0:
+                logger.info(f"📸 Generated {generated_count}/{num_new_images} class images...")
+        
+        logger.info(f"✅ All {num_new_images} class images generated successfully")
         
         del pipeline
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    else:
+        logger.info(f"✅ Found {cur_class_images} existing class images (needed {args.num_class_images}), skipping generation")
 
 
 def main():
@@ -427,54 +438,81 @@ def main():
     # Set seed
     if args.seed is not None:
         set_seed(args.seed)
+        logger.info(f"✅ Set random seed to {args.seed}")
     
     # Generate class images if needed
     if args.with_prior_preservation:
+        logger.info("=" * 60)
+        logger.info("PHASE 1/6: Generating class images for prior preservation")
+        logger.info("=" * 60)
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             torch_dtype=torch.float16,
         )
         generate_class_images(args, pipeline, accelerator)
         del pipeline
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("✅ Class images generated and pipeline cleared from memory")
     
     # Load tokenizer and text encoder
+    logger.info("=" * 60)
+    logger.info("PHASE 2/6: Loading models from Hugging Face")
+    logger.info("=" * 60)
+    logger.info("⏳ Loading tokenizer...")
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="tokenizer",
     )
+    logger.info("✅ Tokenizer loaded")
+    
+    logger.info("⏳ Loading text encoder...")
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
     )
+    logger.info("✅ Text encoder loaded")
     
     # Load scheduler and models
+    logger.info("⏳ Loading noise scheduler...")
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
+    logger.info("✅ Noise scheduler loaded")
     
+    logger.info("⏳ Loading UNet (this is the largest model, may take a moment)...")
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="unet",
     )
+    logger.info("✅ UNet loaded")
     
+    logger.info("⏳ Loading VAE...")
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
     )
+    logger.info("✅ VAE loaded")
     
     # Freeze vae and text_encoder
+    logger.info("⏳ Freezing VAE and text encoder parameters...")
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    logger.info("✅ Models frozen (only UNet will be trained)")
     
     # Enable xformers memory efficient attention if available
     try:
         unet.enable_xformers_memory_efficient_attention()
-        logger.info("Enabled xformers memory efficient attention")
+        logger.info("✅ Enabled xformers memory efficient attention")
     except Exception as e:
-        logger.warning(f"Could not enable xformers: {e}")
+        logger.warning(f"⚠️  Could not enable xformers: {e}")
     
     # Prepare dataset
+    logger.info("=" * 60)
+    logger.info("PHASE 3/6: Preparing training dataset")
+    logger.info("=" * 60)
+    logger.info("⏳ Creating DreamBooth dataset...")
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
         instance_prompt=args.instance_prompt,
@@ -484,10 +522,12 @@ def main():
         size=args.resolution,
         repeats=args.repeats,
     )
+    logger.info(f"✅ Dataset created with {len(train_dataset)} total examples")
     
     def collate_fn_wrapper(examples):
         return collate_fn(examples, with_prior_preservation=args.with_prior_preservation)
     
+    logger.info("⏳ Creating data loader...")
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -495,16 +535,22 @@ def main():
         collate_fn=collate_fn_wrapper,
         num_workers=0,  # Safer for Kaggle
     )
+    logger.info(f"✅ Data loader created with {len(train_dataloader)} batches per epoch")
     
     # Prepare optimizer
+    logger.info("=" * 60)
+    logger.info("PHASE 4/6: Setting up optimizer and scheduler")
+    logger.info("=" * 60)
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
             optimizer_class = bnb.optim.AdamW8bit
+            logger.info("⏳ Using 8-bit Adam optimizer...")
         except ImportError:
             raise ImportError("bitsandbytes is not installed. Install it with: pip install bitsandbytes")
     else:
         optimizer_class = torch.optim.AdamW
+        logger.info("⏳ Using standard AdamW optimizer...")
     
     optimizer = optimizer_class(
         unet.parameters(),
@@ -513,6 +559,7 @@ def main():
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    logger.info(f"✅ Optimizer created (lr={args.learning_rate})")
     
     # Calculate training steps
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -522,19 +569,27 @@ def main():
         args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     
     # Prepare lr scheduler
+    logger.info(f"⏳ Creating {args.lr_scheduler} learning rate scheduler...")
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
+    logger.info("✅ LR scheduler created")
     
     # Prepare everything with accelerator
+    logger.info("=" * 60)
+    logger.info("PHASE 5/6: Preparing models with Accelerate")
+    logger.info("=" * 60)
+    logger.info("⏳ Wrapping models with Accelerate (for distributed training)...")
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
     )
+    logger.info("✅ Models wrapped with Accelerate")
     
     # Move vae and text_encoder to device
+    logger.info(f"⏳ Moving VAE and text encoder to device: {accelerator.device}...")
     vae.to(accelerator.device)
     text_encoder.to(accelerator.device)
     
@@ -542,11 +597,16 @@ def main():
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
+        logger.info("⏳ Casting models to fp16 for mixed precision training...")
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
+        logger.info("⏳ Casting models to bf16 for mixed precision training...")
+    else:
+        logger.info("⏳ Using fp32 (no mixed precision)...")
     
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    logger.info(f"✅ All models on device with dtype={weight_dtype}")
     
     # We need to recalculate our total training steps
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -554,12 +614,16 @@ def main():
     
     # Initialize trackers
     if accelerator.is_main_process:
+        logger.info("⏳ Initializing tracking (tensorboard)...")
         accelerator.init_trackers("dreambooth", config=vars(args))
+        logger.info("✅ Trackers initialized")
     
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     
-    logger.info("***** Running training *****")
+    logger.info("=" * 60)
+    logger.info("PHASE 6/6: TRAINING")
+    logger.info("=" * 60)
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -568,6 +632,9 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     logger.info(f"  Prior preservation = {args.with_prior_preservation}")
+    logger.info("=" * 60)
+    logger.info("🚀 Starting training loop...")
+    logger.info("=" * 60)
     
     global_step = 0
     first_epoch = 0
@@ -580,6 +647,7 @@ def main():
     )
     
     for epoch in range(first_epoch, args.num_train_epochs):
+        logger.info(f"📍 Epoch {epoch + 1}/{args.num_train_epochs} started")
         unet.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
@@ -641,10 +709,15 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 
+                # Log progress every 50 steps
+                if global_step % 50 == 0:
+                    logger.info(f"📊 Progress: {global_step}/{args.max_train_steps} steps ({100*global_step/args.max_train_steps:.1f}%) | Loss: {loss.detach().item():.4f}")
+                
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
+                    logger.info(f"💾 Saving checkpoint at step {global_step}...")
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
-                    logger.info(f"Saved state to {save_path}")
+                    logger.info(f"✅ Checkpoint saved to {save_path}")
                     
                     # Remove old checkpoints if limit is set
                     if args.checkpoints_total_limit is not None:
@@ -669,11 +742,18 @@ def main():
                 accelerator.log(logs, step=global_step)
             
             if global_step >= args.max_train_steps:
+                logger.info(f"✅ Reached max training steps ({args.max_train_steps})")
                 break
+        
+        logger.info(f"✅ Epoch {epoch + 1}/{args.num_train_epochs} completed")
     
     # Create the pipeline using the trained modules and save it
+    logger.info("=" * 60)
+    logger.info("FINALIZING: Saving trained model")
+    logger.info("=" * 60)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        logger.info("⏳ Creating Stable Diffusion pipeline with trained UNet...")
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             unet=accelerator.unwrap_model(unet),
@@ -681,8 +761,11 @@ def main():
             vae=vae,
             tokenizer=tokenizer,
         )
+        logger.info("⏳ Saving pipeline to disk...")
         pipeline.save_pretrained(args.output_dir)
-        logger.info(f"Pipeline saved to {args.output_dir}")
+        logger.info("=" * 60)
+        logger.info(f"✅ SUCCESS! Model saved to: {args.output_dir}")
+        logger.info("=" * 60)
     
     accelerator.end_training()
 
