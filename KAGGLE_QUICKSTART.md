@@ -47,9 +47,22 @@ Upload 3-10 images to `instance_images/`:
 
 ### 4. Run Training
 
-#### Recommended: LITE MODE (Most Stable)
+#### Option A: Multi-GPU (2x T4) - FASTEST & BEST
 
-For most reliable training on Kaggle:
+If you have **2x T4 GPUs** (check Kaggle settings):
+
+```bash
+%%bash
+export INSTANCE_PROMPT="a photo of sks dog"
+export CLASS_PROMPT="a photo of dog"
+bash run_multi_gpu.sh
+```
+
+**Benefits**: 30GB memory, 2x speed, full prior preservation, 512px resolution!
+
+#### Option B: LITE MODE (Single GPU, Most Stable)
+
+For single T4 or if you hit memory issues:
 
 ```bash
 %%bash
@@ -57,25 +70,24 @@ export INSTANCE_PROMPT="a photo of sks dog"  # Or your subject
 bash run_lite.sh
 ```
 
-Lite mode is optimized for Kaggle and avoids common segfault issues.
+#### Option C: Ultra-Lite (If LITE fails)
 
-#### Standard Mode (If You Have Good GPU)
-
-If you're on P100 or T4 x2 with no memory issues:
+If you still get Out of Memory:
 
 ```bash
 %%bash
 export INSTANCE_PROMPT="a photo of sks dog"
-export CLASS_PROMPT="a photo of dog"
-bash run.sh
+export RESOLUTION=384  # Lower resolution
+bash run_ultra_lite.sh
 ```
 
 ### 5. Wait for Training
 
 Training takes approximately:
-- **T4 GPU**: ~30-40 minutes
-- **P100 GPU**: ~20-30 minutes
-- **T4 x2 GPU**: ~15-20 minutes
+- **2x T4 GPU** (run_multi_gpu.sh): ~20-25 minutes ⚡ (FASTEST)
+- **Single T4** (run_lite.sh): ~30-40 minutes
+- **Single P100**: ~20-30 minutes
+- **Single T4** (run_ultra_lite.sh): ~25-35 minutes (lower res)
 
 You'll see progress with:
 - Class image generation (if first time)
