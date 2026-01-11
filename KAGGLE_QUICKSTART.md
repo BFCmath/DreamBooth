@@ -47,37 +47,34 @@ Upload 3-10 images to `instance_images/`:
 
 ### 4. Run Training
 
-#### Option A: Multi-GPU (2x T4) - FASTEST & BEST
+#### ✅ RECOMMENDED: Single GPU Optimized (Most Reliable)
 
-If you have **2x T4 GPUs** (check Kaggle settings):
-
-```bash
-%%bash
-export INSTANCE_PROMPT="a photo of sks dog"
-export CLASS_PROMPT="a photo of dog"
-bash run_multi_gpu.sh
-```
-
-**Benefits**: 30GB memory, 2x speed, full prior preservation, 512px resolution!
-
-#### Option B: LITE MODE (Single GPU, Most Stable)
-
-For single T4 or if you hit memory issues:
-
-```bash
-%%bash
-export INSTANCE_PROMPT="a photo of sks dog"  # Or your subject
-bash run_lite.sh
-```
-
-#### Option C: Ultra-Lite (If LITE fails)
-
-If you still get Out of Memory:
+This uses fp32 (no mixed precision) to avoid segfaults:
 
 ```bash
 %%bash
 export INSTANCE_PROMPT="a photo of sks dog"
-export RESOLUTION=384  # Lower resolution
+bash run_single_gpu_optimized.sh
+```
+
+**Why this works**: fp32 avoids segfaults, gradient accumulation for efficiency, ~40min, 512px resolution
+
+#### Option B: Multi-GPU Stable (If you have 2x T4)
+
+```bash
+%%bash
+export INSTANCE_PROMPT="a photo of sks dog"
+bash run_multi_gpu_stable.sh
+```
+
+**Note**: Uses fp32 for stability, ~25min with 2 GPUs
+
+#### Option C: Ultra-Lite (If memory issues)
+
+```bash
+%%bash
+export INSTANCE_PROMPT="a photo of sks dog"
+export RESOLUTION=384
 bash run_ultra_lite.sh
 ```
 
