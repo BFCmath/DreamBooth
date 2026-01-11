@@ -1,4 +1,5 @@
-torchvision>=0.15.0
+# Note: torch and torchvision are NOT included here
+# Kaggle has these preinstalled and installing them can cause version conflicts
 diffusers>=0.21.0
 transformers>=4.30.0
 accelerate>=0.20.0

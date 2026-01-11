@@ -43,24 +43,25 @@ except Exception as e:
 
 ---
 
-### 3. **Removed torch from requirements.txt** (CRITICAL for Kaggle)
-**Problem**: Installing torch on Kaggle can break CUDA wheels and cause version conflicts  
-**Fix**: Removed `torch>=2.0.0` from requirements.txt  
-**Impact**: Avoids dependency conflicts with Kaggle's preinstalled torch
+### 3. **Removed torch and torchvision from requirements.txt** (CRITICAL for Kaggle)
+**Problem**: Installing torch/torchvision on Kaggle can break CUDA wheels and cause version conflicts  
+**Fix**: Removed `torch>=2.0.0` and `torchvision>=0.15.0` from requirements.txt  
+**Impact**: Avoids dependency conflicts with Kaggle's preinstalled versions
 
 **Location**: `requirements.txt`
 
 ```txt
-# REMOVED:
+# REMOVED (Kaggle has these preinstalled):
 # torch>=2.0.0
+# torchvision>=0.15.0
 
 # KEPT:
-torchvision>=0.15.0
 diffusers>=0.21.0
 transformers>=4.30.0
 accelerate>=0.20.0
 xformers>=0.0.20  # Optional, installed by run.sh
 bitsandbytes>=0.41.0  # Optional, installed by run.sh
+huggingface_hub>=0.16.0
 ...
 ```
 

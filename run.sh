@@ -8,9 +8,9 @@ echo "========================================="
 echo "DreamBooth Training for Stable Diffusion"
 echo "========================================="
 
-# Install dependencies (skip torch to avoid conflicts with Kaggle's preinstalled version)
+# Install dependencies (skip torch/torchvision to avoid conflicts with Kaggle's preinstalled versions)
 echo "Installing dependencies..."
-pip install -q diffusers transformers accelerate pillow numpy tqdm tensorboard huggingface_hub
+pip install -q diffusers transformers accelerate huggingface_hub
 
 # Try to install xformers (may fail on some platforms, that's okay)
 pip install -q xformers 2>/dev/null || echo "Warning: xformers not installed (optional, for memory efficiency)"

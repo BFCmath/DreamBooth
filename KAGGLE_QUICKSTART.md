@@ -169,10 +169,11 @@ export TRAIN_BATCH_SIZE=1
 bash run.sh
 ```
 
-### CUDA Errors
+### CUDA Errors / torchvision::nms Error
 - Make sure GPU is enabled in Kaggle settings
-- Restart notebook and try again
-- Don't run `pip install torch` (uses Kaggle's preinstalled version)
+- **Restart notebook** and try again
+- **Don't run** `pip install torch` or `pip install torchvision`
+- Kaggle has these preinstalled - installing them causes version conflicts!
 
 ### Slow Training
 - Make sure GPU is enabled (not CPU)
