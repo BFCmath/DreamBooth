@@ -181,14 +181,25 @@ bash run.sh
 - Kaggle has these preinstalled - installing them causes version conflicts!
 
 ### Segmentation Fault
-```bash
-# Use lite mode (most stable)
-!bash run_lite.sh
 
-# Or reduce memory usage
-!export NUM_CLASS_IMAGES=50
-!bash run.sh
+This is a serious issue. Try in order:
+
+```bash
+# 1. Debug where it's failing
+!python debug_segfault.py
+
+# 2. Try ultra-lite mode (fp32, no mixed precision)
+!bash run_ultra_lite.sh
+
+# 3. If still fails, restart kernel completely
+# Kaggle UI: ⋮ → Restart Session
+# Then run again
+
+# 4. Use P100 instead of T4
+# Kaggle UI: Settings → Accelerator → P100
 ```
+
+See [TROUBLESHOOT_KAGGLE.md](TROUBLESHOOT_KAGGLE.md) for detailed diagnosis.
 
 ### Slow Training
 - Make sure GPU is enabled (not CPU)
