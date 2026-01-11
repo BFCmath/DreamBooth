@@ -93,7 +93,21 @@ You'll see progress with:
 
 ### 6. Generate Images
 
-After training completes:
+#### ✅ EASIEST: Use the Quick Generation Script
+
+After training completes, just run:
+
+```python
+!python generate_quick.py
+```
+
+This will automatically:
+- Load your trained model
+- Generate 5 different test images
+- Display them in the notebook
+- Save them to `./generated_images/`
+
+#### Option B: Generate Single Image (Manual)
 
 ```python
 from diffusers import StableDiffusionPipeline
@@ -102,34 +116,58 @@ import torch
 # Load your trained model
 pipe = StableDiffusionPipeline.from_pretrained(
     "./output/dreambooth-model",
-    torch_dtype=torch.float16
+    torch_dtype=torch.float16,
+    safety_checker=None  # Faster inference
 ).to("cuda")
 
 # Generate an image
-prompt = "a photo of sks dog in a beautiful garden"  # Change based on your subject
+prompt = "a photo of sks person in a beautiful garden"  # Change 'person' to your subject
 image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
 
-# Display
+# Display and save
 display(image)
-
-# Save
 image.save("my_generated_image.png")
 ```
 
-### 7. Try Different Prompts
+#### Option C: Advanced Generation (Custom Prompts)
+
+```bash
+# Generate with custom prompts and settings
+!python generate_images.py \
+    --prompts "a photo of sks person at the beach" \
+              "sks person wearing sunglasses" \
+              "oil painting of sks person" \
+    --num_images_per_prompt 2 \
+    --num_inference_steps 75 \
+    --guidance_scale 8.0 \
+    --seed 42
+```
+
+See `python generate_images.py --help` for all options.
+
+### 7. Tips for Better Results
+
+**Prompt Tips:**
+- Always include your unique identifier (`sks person`, `sks dog`, etc.)
+- Try different styles: "photo", "oil painting", "digital art", "sketch"
+- Add context: "at the beach", "in space", "wearing a hat"
+- Adjust `guidance_scale`: 7.5 (default), higher = more prompt adherence
+- Increase `num_inference_steps` for better quality (50-100)
+
+**Example Prompts:**
 
 ```python
 prompts = [
-    "a photo of sks dog on the beach",
-    "a photo of sks dog wearing sunglasses",
-    "oil painting of sks dog",
-    "sks dog as a superhero",
+    "a professional photo of sks person in a business suit",
+    "sks person as a astronaut in space",
+    "oil painting of sks person in renaissance style",
+    "sks person wearing sunglasses at sunset",
+    "digital art of sks person as a superhero",
 ]
 
-for i, prompt in enumerate(prompts):
-    image = pipe(prompt, num_inference_steps=50).images[0]
+for prompt in prompts:
+    image = pipe(prompt, num_inference_steps=75, guidance_scale=8.0).images[0]
     display(image)
-    image.save(f"output_{i}.png")
 ```
 
 ## Complete Single-Cell Example
