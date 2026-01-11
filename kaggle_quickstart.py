@@ -5,10 +5,14 @@ Run this in a Kaggle notebook cell for easy setup and training
 """
 
 # Step 1: Clone the repository (if needed)
-# !git clone <your-repo-url>
-# %cd <repo-name>
+# !git clone https://github.com/BFCmath/DreamBooth.git
+# %cd DreamBooth
 
-# Step 2: Upload images to instance_images/ directory
+# Step 2: Get training images
+# Option A: Use example images (for quick test)
+# !python download_example_images.py dog
+
+# Option B: Upload your own images to instance_images/ directory
 # Use Kaggle's upload feature or link a dataset
 
 # Step 3: Run this cell to train

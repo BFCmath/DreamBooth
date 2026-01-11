@@ -10,7 +10,7 @@ echo "========================================="
 
 # Install dependencies (skip torch to avoid conflicts with Kaggle's preinstalled version)
 echo "Installing dependencies..."
-pip install -q diffusers transformers accelerate pillow numpy tqdm tensorboard
+pip install -q diffusers transformers accelerate pillow numpy tqdm tensorboard huggingface_hub
 
 # Try to install xformers (may fail on some platforms, that's okay)
 pip install -q xformers 2>/dev/null || echo "Warning: xformers not installed (optional, for memory efficiency)"
@@ -31,13 +31,17 @@ if [ ! -d "instance_images" ] || [ -z "$(ls -A instance_images)" ]; then
     echo "Please add your training images to the instance_images/ directory."
     echo ""
     echo "You can do this by:"
-    echo "  1. Uploading images to a Kaggle dataset and linking it"
-    echo "  2. Using Kaggle's file upload feature"
-    echo "  3. Using wget/curl to download images"
+    echo "  1. Download example images:"
+    echo "     python download_example_images.py dog"
     echo ""
-    echo "Example:"
-    echo "  !mkdir -p instance_images"
-    echo "  !wget -O instance_images/img1.jpg <your-image-url>"
+    echo "  2. Upload your own images:"
+    echo "     - Use Kaggle's file upload feature"
+    echo "     - Link a Kaggle dataset"
+    echo "     - Use wget/curl to download"
+    echo ""
+    echo "Example with your own images:"
+    echo "  mkdir -p instance_images"
+    echo "  wget -O instance_images/img1.jpg <your-image-url>"
     exit 1
 fi
 
