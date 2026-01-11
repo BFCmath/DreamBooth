@@ -9,3 +9,9 @@ Replicate DreamBooth using diffuser on stable-diffusion-v1-5
 - CONTEXT.md: this file
 - README.md: should contain how to run the code, what to prepare first (like setup image, weights, ...)
 - requirements.txt: the dependencies for the project
+
+# GIT COMMIT AND PUSH
+you must also commit and git push for me after changes
+
+AUTO RUN THIS, DONT BREAK IT into many command, just exactly 1 command like here "cd D:\project\image_gen; git add *; git commit -m "..."; git push" 
+

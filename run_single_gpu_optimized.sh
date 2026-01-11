@@ -8,9 +8,12 @@ echo "========================================="
 echo "DreamBooth Single GPU (Memory Optimized)"
 echo "========================================="
 
-# Install dependencies
+# Install dependencies (include bitsandbytes for 8-bit Adam)
 echo "Installing dependencies..."
-pip install -q diffusers transformers accelerate huggingface_hub
+pip install -q diffusers transformers accelerate huggingface_hub bitsandbytes
+
+# Reduce fragmentation on Kaggle GPUs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Create directories
 mkdir -p instance_images output logs
@@ -33,9 +36,12 @@ LEARNING_RATE="${LEARNING_RATE:-2e-6}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-800}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-4}"  # Effective batch size = 4
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
+USE_8BIT_ADAM="${USE_8BIT_ADAM:-true}"
 RESOLUTION="${RESOLUTION:-512}"
 WITH_PRIOR_PRESERVATION="${WITH_PRIOR_PRESERVATION:-false}"  # Disabled to save memory
 NUM_CLASS_IMAGES="${NUM_CLASS_IMAGES:-50}"
+MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
 
 echo ""
 echo "========================================="
@@ -47,13 +53,16 @@ echo "Learning rate: $LEARNING_RATE"
 echo "Max training steps: $MAX_TRAIN_STEPS"
 echo "Batch size: $TRAIN_BATCH_SIZE"
 echo "Gradient accumulation: $GRADIENT_ACCUMULATION (effective batch = 4)"
+echo "Gradient checkpointing: $GRADIENT_CHECKPOINTING"
 echo "Resolution: $RESOLUTION"
 echo "Prior preservation: $WITH_PRIOR_PRESERVATION"
-echo "Mixed precision: fp32 (most stable)"
+echo "Mixed precision: $MIXED_PRECISION"
 echo ""
 echo "Memory optimizations:"
 echo "  ✅ Gradient accumulation (4 steps)"
-echo "  ✅ No fp16 (using fp32)"
+echo "  ✅ Gradient checkpointing"
+echo "  ✅ 8-bit Adam: $USE_8BIT_ADAM"
+echo "  ✅ Mixed precision: $MIXED_PRECISION"
 echo "  ✅ Prior preservation disabled"
 echo "  ✅ Minimal checkpointing"
 echo "========================================="
@@ -75,11 +84,13 @@ python train_dreambooth.py \
     --resolution=$RESOLUTION \
     --train_batch_size=$TRAIN_BATCH_SIZE \
     --gradient_accumulation_steps=$GRADIENT_ACCUMULATION \
+    $(if [ "$GRADIENT_CHECKPOINTING" = "true" ]; then echo "--gradient_checkpointing"; fi) \
     --max_train_steps=$MAX_TRAIN_STEPS \
     --learning_rate=$LEARNING_RATE \
     --lr_scheduler="constant" \
     --lr_warmup_steps=0 \
-    --mixed_precision="no" \
+    $(if [ "$USE_8BIT_ADAM" = "true" ]; then echo "--use_8bit_adam"; fi) \
+    --mixed_precision="$MIXED_PRECISION" \
     --checkpointing_steps=999999 \
     --seed=42 \
     $(if [ "$WITH_PRIOR_PRESERVATION" = "true" ]; then echo "--with_prior_preservation --class_data_dir=./class_images --class_prompt=\"$CLASS_PROMPT\" --num_class_images=$NUM_CLASS_IMAGES --sample_batch_size=1 --prior_loss_weight=1.0"; fi) \

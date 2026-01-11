@@ -49,7 +49,7 @@ Upload 3-10 images to `instance_images/`:
 
 #### ✅ RECOMMENDED: Single GPU Optimized (Most Reliable)
 
-This uses fp32 (no mixed precision) to avoid segfaults:
+This uses fp16 + gradient checkpointing + 8-bit Adam to fit a single T4 without OOM:
 
 ```bash
 %%bash
@@ -57,7 +57,7 @@ export INSTANCE_PROMPT="a photo of sks dog"
 bash run_single_gpu_optimized.sh
 ```
 
-**Why this works**: fp32 avoids segfaults, gradient accumulation for efficiency, ~40min, 512px resolution
+**Why this works**: fp16 cuts memory, gradient checkpointing reduces peak VRAM, 8-bit Adam saves optimizer memory, gradient accumulation keeps effective batch size 4, ~40min, 512px resolution
 
 #### Option B: Multi-GPU Stable (If you have 2x T4)
 
@@ -167,6 +167,7 @@ image.save("result.png")
 ## Troubleshooting
 
 ### "No training images found"
+
 ```python
 # Check what's in the directory
 !ls -la instance_images/
@@ -176,6 +177,7 @@ image.save("result.png")
 ```
 
 ### Out of Memory
+
 ```bash
 %%bash
 export RESOLUTION=384

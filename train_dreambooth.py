@@ -251,6 +251,11 @@ def parse_args():
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to save memory at the cost of speed.",
+    )
+    parser.add_argument(
         "--learning_rate",
         type=float,
         default=5e-6,
@@ -500,6 +505,10 @@ def main():
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     logger.info("✅ Models frozen (only UNet will be trained)")
+
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+        logger.info("✅ Enabled UNet gradient checkpointing")
     
     # Enable xformers memory efficient attention if available
     try:
@@ -702,7 +711,7 @@ def main():
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
             
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
