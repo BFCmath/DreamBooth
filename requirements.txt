@@ -1,12 +1,3 @@
 # Note: torch and torchvision are NOT included here
 # Kaggle has these preinstalled and installing them can cause version conflicts
-diffusers>=0.21.0
-transformers>=4.30.0
-accelerate>=0.20.0
-xformers>=0.0.20
-pillow>=9.5.0
-numpy>=1.24.0
-tqdm>=4.65.0
-tensorboard>=2.13.0
-bitsandbytes>=0.41.0
 huggingface_hub>=0.16.0

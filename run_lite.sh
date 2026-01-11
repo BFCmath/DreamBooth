@@ -1,22 +1,19 @@
 #!/bin/bash
-# DreamBooth Training Script for Kaggle
-# This script sets up the environment and runs proper DreamBooth training with prior preservation
+# DreamBooth Training Script - LITE MODE for Kaggle
+# This version uses minimal memory and is more stable on low-resource environments
 
 set -e  # Exit on error
 
 echo "========================================="
-echo "DreamBooth Training for Stable Diffusion"
+echo "DreamBooth LITE MODE (Memory Optimized)"
 echo "========================================="
 
-# Install dependencies (skip torch/torchvision to avoid conflicts with Kaggle's preinstalled versions)
+# Install dependencies (skip torch/torchvision to avoid conflicts)
 echo "Installing dependencies..."
 pip install -q diffusers transformers accelerate huggingface_hub
 
-# Try to install xformers (may fail on some platforms, that's okay)
-pip install -q xformers 2>/dev/null || echo "Warning: xformers not installed (optional, for memory efficiency)"
-
-# Try to install bitsandbytes (may fail on some platforms, that's okay)
-pip install -q bitsandbytes 2>/dev/null || echo "Warning: bitsandbytes not installed (optional, for 8-bit Adam)"
+# Skip xformers and bitsandbytes to avoid segfaults
+echo "Skipping optional packages for stability..."
 
 # Create necessary directories
 mkdir -p instance_images
@@ -30,18 +27,8 @@ if [ ! -d "instance_images" ] || [ -z "$(ls -A instance_images)" ]; then
     echo "========================================="
     echo "Please add your training images to the instance_images/ directory."
     echo ""
-    echo "You can do this by:"
-    echo "  1. Download example images:"
-    echo "     python download_example_images.py dog"
-    echo ""
-    echo "  2. Upload your own images:"
-    echo "     - Use Kaggle's file upload feature"
-    echo "     - Link a Kaggle dataset"
-    echo "     - Use wget/curl to download"
-    echo ""
-    echo "Example with your own images:"
-    echo "  mkdir -p instance_images"
-    echo "  wget -O instance_images/img1.jpg <your-image-url>"
+    echo "Quick start:"
+    echo "  python download_example_images.py dog"
     exit 1
 fi
 
@@ -49,22 +36,22 @@ fi
 NUM_IMAGES=$(ls instance_images/*.{jpg,jpeg,png,JPG,JPEG,PNG} 2>/dev/null | wc -l)
 echo "Found $NUM_IMAGES training images in instance_images/"
 
-# Set default values if not provided
+# LITE MODE defaults - optimized for stability and low memory
 INSTANCE_PROMPT="${INSTANCE_PROMPT:-a photo of sks person}"
 CLASS_PROMPT="${CLASS_PROMPT:-a photo of person}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/dreambooth-model}"
 LEARNING_RATE="${LEARNING_RATE:-2e-6}"
-MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-1000}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-800}"  # Slightly fewer steps
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 RESOLUTION="${RESOLUTION:-512}"
-WITH_PRIOR_PRESERVATION="${WITH_PRIOR_PRESERVATION:-true}"
-NUM_CLASS_IMAGES="${NUM_CLASS_IMAGES:-100}"  # Reduced from 200 to save memory
+WITH_PRIOR_PRESERVATION="${WITH_PRIOR_PRESERVATION:-false}"  # Disabled by default in lite mode
+NUM_CLASS_IMAGES="${NUM_CLASS_IMAGES:-50}"  # Much fewer if enabled
 PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-1.0}"
-SAMPLE_BATCH_SIZE="${SAMPLE_BATCH_SIZE:-2}"  # Batch size for generating class images
+SAMPLE_BATCH_SIZE="${SAMPLE_BATCH_SIZE:-1}"  # Smaller batches
 
 echo ""
 echo "========================================="
-echo "Training Configuration"
+echo "LITE MODE Configuration"
 echo "========================================="
 echo "Instance prompt: $INSTANCE_PROMPT"
 echo "Class prompt: $CLASS_PROMPT"
@@ -73,21 +60,18 @@ echo "Learning rate: $LEARNING_RATE"
 echo "Max training steps: $MAX_TRAIN_STEPS"
 echo "Batch size: $TRAIN_BATCH_SIZE"
 echo "Resolution: $RESOLUTION"
-echo "Prior preservation: $WITH_PRIOR_PRESERVATION"
+echo "Prior preservation: $WITH_PRIOR_PRESERVATION (disabled for memory savings)"
 if [ "$WITH_PRIOR_PRESERVATION" = "true" ]; then
     echo "Number of class images: $NUM_CLASS_IMAGES"
-    echo "Sample batch size: $SAMPLE_BATCH_SIZE"
-    echo "Prior loss weight: $PRIOR_LOSS_WEIGHT"
 fi
+echo ""
+echo "Memory optimizations enabled:"
+echo "  - No xformers (avoids segfaults)"
+echo "  - No 8-bit Adam (more stable)"
+echo "  - Smaller class image set"
+echo "  - Conservative settings"
 echo "========================================="
 echo ""
-
-# Check available memory
-if command -v nvidia-smi &> /dev/null; then
-    echo "GPU Memory Check:"
-    nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits | head -1 | awk '{printf "  Total: %.1f GB, Free: %.1f GB\n", $1/1024, $2/1024}'
-    echo ""
-fi
 
 # Build command
 CMD="python train_dreambooth.py \
@@ -103,6 +87,7 @@ CMD="python train_dreambooth.py \
     --lr_warmup_steps=0 \
     --mixed_precision=\"fp16\" \
     --checkpointing_steps=500 \
+    --checkpoints_total_limit=2 \
     --seed=42"
 
 # Add prior preservation arguments if enabled
@@ -117,7 +102,7 @@ if [ "$WITH_PRIOR_PRESERVATION" = "true" ]; then
 fi
 
 # Run training
-echo "Starting DreamBooth training..."
+echo "Starting DreamBooth training (LITE MODE)..."
 echo ""
 eval $CMD
 

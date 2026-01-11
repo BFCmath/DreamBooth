@@ -47,21 +47,26 @@ Upload 3-10 images to `instance_images/`:
 
 ### 4. Run Training
 
-#### If you used example dog images:
+#### Recommended: LITE MODE (Most Stable)
+
+For most reliable training on Kaggle:
+
+```bash
+%%bash
+export INSTANCE_PROMPT="a photo of sks dog"  # Or your subject
+bash run_lite.sh
+```
+
+Lite mode is optimized for Kaggle and avoids common segfault issues.
+
+#### Standard Mode (If You Have Good GPU)
+
+If you're on P100 or T4 x2 with no memory issues:
 
 ```bash
 %%bash
 export INSTANCE_PROMPT="a photo of sks dog"
 export CLASS_PROMPT="a photo of dog"
-bash run.sh
-```
-
-#### If you used your own images:
-
-```bash
-%%bash
-export INSTANCE_PROMPT="a photo of sks person"  # Change based on your subject
-export CLASS_PROMPT="a photo of person"         # Change to match
 bash run.sh
 ```
 
@@ -174,6 +179,16 @@ bash run.sh
 - **Restart notebook** and try again
 - **Don't run** `pip install torch` or `pip install torchvision`
 - Kaggle has these preinstalled - installing them causes version conflicts!
+
+### Segmentation Fault
+```bash
+# Use lite mode (most stable)
+!bash run_lite.sh
+
+# Or reduce memory usage
+!export NUM_CLASS_IMAGES=50
+!bash run.sh
+```
 
 ### Slow Training
 - Make sure GPU is enabled (not CPU)
