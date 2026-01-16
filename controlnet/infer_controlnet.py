@@ -43,6 +43,7 @@ def generate_images(
     seed: int = None,
     use_pose_image_directly: bool = False,
     negative_prompt: str = "lowres, bad anatomy, worst quality, low quality, deformed, ugly",
+    low_vram_mode: bool = False,
 ):
     """
     Generate images using ControlNet with OpenPose conditioning.
@@ -62,6 +63,7 @@ def generate_images(
         seed: Random seed for reproducibility
         use_pose_image_directly: If True, skip pose extraction
         negative_prompt: What to avoid in generation
+        low_vram_mode: Enable aggressive memory optimizations for P100 (16GB)
     """
     
     print("=" * 60)
@@ -79,6 +81,7 @@ def generate_images(
     print(f"Resolution: {width}x{height}")
     if seed is not None:
         print(f"Seed: {seed}")
+    print(f"Low VRAM mode: {low_vram_mode}")
     print("=" * 60)
     print()
     
@@ -95,7 +98,47 @@ def generate_images(
         print(f"📊 GPU Memory: {gpu_mem:.1f} GB")
     print()
     
-    # Load ControlNet
+    # =========================================
+    # STEP 1: Extract pose FIRST (if needed)
+    # This runs the OpenPose detector separately to free GPU memory before loading SD
+    # =========================================
+    if use_pose_image_directly:
+        print("📷 Using input as pose image directly")
+        pose_image = load_image(input_image)
+    else:
+        print("🕺 Extracting pose from input image...")
+        print("   (Running OpenPose detector separately to save VRAM)")
+        from controlnet_aux import OpenposeDetector
+        
+        # Load OpenPose detector
+        openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+        if device == "cuda":
+            openpose = openpose.to(device)
+        
+        pose_image = extract_pose(input_image, openpose)
+        
+        # Save extracted pose for reference
+        pose_save_path = os.path.join(output_dir, "extracted_pose.png")
+        pose_image.save(pose_save_path)
+        print(f"💾 Saved extracted pose to: {pose_save_path}")
+        
+        # FREE GPU MEMORY: Delete OpenPose detector before loading SD pipeline
+        print("🧹 Clearing OpenPose from GPU memory...")
+        del openpose
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        import gc
+        gc.collect()
+        print("✅ GPU memory cleared!")
+    
+    # Resize pose image to target size
+    pose_image = pose_image.resize((width, height))
+    print()
+    
+    # =========================================
+    # STEP 2: Load ControlNet and SD Pipeline
+    # =========================================
     print(f"⏳ Loading ControlNet: {controlnet_model}")
     controlnet = ControlNetModel.from_pretrained(
         controlnet_model,
@@ -114,32 +157,36 @@ def generate_images(
     
     # Use faster scheduler
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-    pipe = pipe.to(device)
     
-    # Enable memory optimizations for P100
-    if device == "cuda":
-        pipe.enable_xformers_memory_efficient_attention()
+    # =========================================
+    # STEP 3: Apply memory optimizations
+    # =========================================
+    print("🔧 Applying memory optimizations...")
     
-    print("✅ Pipeline loaded!")
-    print()
-    
-    # Get pose image
-    if use_pose_image_directly:
-        print("📷 Using input as pose image directly")
-        pose_image = load_image(input_image)
-    else:
-        print("🕺 Extracting pose from input image...")
-        from controlnet_aux import OpenposeDetector
-        openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
-        pose_image = extract_pose(input_image, openpose)
+    if low_vram_mode and device == "cuda":
+        # AGGRESSIVE MEMORY SAVING for P100 (16GB)
+        print("   ⚡ LOW VRAM MODE: Using sequential CPU offloading")
+        pipe.enable_sequential_cpu_offload()
+    elif device == "cuda":
+        # Standard optimizations
+        pipe = pipe.to(device)
         
-        # Save extracted pose for reference
-        pose_save_path = os.path.join(output_dir, "extracted_pose.png")
-        pose_image.save(pose_save_path)
-        print(f"💾 Saved extracted pose to: {pose_save_path}")
+        # Try xformers first, fall back to attention slicing
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("   ✅ xformers memory efficient attention enabled")
+        except Exception as e:
+            print(f"   ⚠️  xformers not available: {e}")
+            print("   ✅ Using attention slicing instead")
+            pipe.enable_attention_slicing("auto")
+        
+        # Enable VAE slicing for lower memory during decode
+        pipe.enable_vae_slicing()
+        print("   ✅ VAE slicing enabled")
+    else:
+        pipe = pipe.to(device)
     
-    # Resize pose image to target size
-    pose_image = pose_image.resize((width, height))
+    print("✅ Pipeline ready!")
     print()
     
     # Set up generator for reproducibility
@@ -315,6 +362,11 @@ def main():
         default="lowres, bad anatomy, worst quality, low quality, deformed, ugly",
         help="Negative prompt to avoid unwanted features",
     )
+    parser.add_argument(
+        "--low_vram",
+        action="store_true",
+        help="Enable low VRAM mode for P100 (16GB) - uses CPU offloading",
+    )
     
     args = parser.parse_args()
     
@@ -333,6 +385,7 @@ def main():
         seed=args.seed,
         use_pose_image_directly=args.use_pose_directly,
         negative_prompt=args.negative_prompt,
+        low_vram_mode=args.low_vram,
     )
 
 

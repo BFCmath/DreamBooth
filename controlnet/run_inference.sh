@@ -51,6 +51,10 @@ SEED="${SEED:-42}"
 # Set to "true" to use input image as pose directly (skip pose extraction)
 USE_POSE_DIRECTLY="${USE_POSE_DIRECTLY:-false}"
 
+# LOW VRAM MODE: Enable aggressive memory optimizations for P100 (16GB)
+# Uses sequential CPU offloading - slower but uses much less GPU memory
+LOW_VRAM_MODE="${LOW_VRAM_MODE:-true}"
+
 # Negative prompt
 NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-lowres, bad anatomy, worst quality, low quality, deformed, ugly}"
 
@@ -72,6 +76,7 @@ echo "ControlNet scale: $CONTROLNET_SCALE"
 echo "Resolution: ${WIDTH}x${HEIGHT}"
 echo "Seed: $SEED"
 echo "Use pose directly: $USE_POSE_DIRECTLY"
+echo "Low VRAM mode: $LOW_VRAM_MODE"
 echo "========================================="
 echo ""
 
@@ -127,6 +132,11 @@ CMD="python infer_controlnet.py \
 # Add pose direct flag if enabled
 if [ "$USE_POSE_DIRECTLY" = "true" ]; then
     CMD="$CMD --use_pose_directly"
+fi
+
+# Add low VRAM flag if enabled
+if [ "$LOW_VRAM_MODE" = "true" ]; then
+    CMD="$CMD --low_vram"
 fi
 
 # Run inference
