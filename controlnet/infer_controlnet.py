@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
 from diffusers.utils import load_image
+import gc
 
 
 def extract_pose(image_path: str, detector):
@@ -165,28 +166,32 @@ def generate_images(
     
     if low_vram_mode and device == "cuda":
         # AGGRESSIVE MEMORY SAVING for P100 (16GB)
-        # This combination should reduce VRAM from ~14GB to ~8GB
-        print("   ⚡ LOW VRAM MODE ENABLED")
+        # Techniques from DreamBooth training script
+        print("   ⚡ LOW VRAM MODE ENABLED (DreamBooth optimizations)")
         
-        # 1. Enable model CPU offload (moves entire models, faster than sequential)
-        pipe.enable_model_cpu_offload()
-        print("   ✅ Model CPU offload enabled")
+        # 1. Enable gradient checkpointing on UNet (trades compute for memory)
+        pipe.unet.enable_gradient_checkpointing()
+        print("   ✅ UNet gradient checkpointing enabled")
         
-        # 2. Enable attention slicing (reduces memory during attention computation)
-        pipe.enable_attention_slicing("max")
-        print("   ✅ Attention slicing enabled (max)")
+        # 2. Enable sequential CPU offload (most aggressive, moves layers to CPU)
+        pipe.enable_sequential_cpu_offload()
+        print("   ✅ Sequential CPU offload enabled")
         
-        # 3. Enable VAE slicing (reduces memory during VAE decode)
+        # 3. Enable attention slicing (reduces memory during attention computation)
+        pipe.enable_attention_slicing(1)  # slice_size=1 for minimum memory
+        print("   ✅ Attention slicing enabled (slice_size=1)")
+        
+        # 4. Enable VAE slicing (reduces memory during VAE decode)
         pipe.enable_vae_slicing()
         print("   ✅ VAE slicing enabled")
         
-        # 4. Enable VAE tiling (for processing large images in tiles)
+        # 5. Enable VAE tiling (for processing large images in tiles)
         pipe.enable_vae_tiling()
         print("   ✅ VAE tiling enabled")
         
-        # 5. Try xformers on top of other optimizations
+        # 6. Try xformers on top of other optimizations
         try:
-            pipe.enable_xformers_memory_efficient_attention()
+            pipe.unet.enable_xformers_memory_efficient_attention()
             print("   ✅ xformers memory efficient attention enabled")
         except Exception:
             pass  # Already using attention slicing as fallback
@@ -247,8 +252,16 @@ def generate_images(
             all_images.append((prompt, image, filepath))
             print(f"✅ Saved: {filepath}")
             
+            # Clear VRAM after each image (DreamBooth technique)
+            if device == "cuda" and low_vram_mode:
+                torch.cuda.empty_cache()
+                gc.collect()
+            
         except Exception as e:
             print(f"❌ Error generating image {i + 1}: {e}")
+            # Clear cache on error too
+            if device == "cuda":
+                torch.cuda.empty_cache()
             continue
     
     print()

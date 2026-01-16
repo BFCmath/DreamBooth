@@ -13,7 +13,7 @@ echo "📦 Installing dependencies..."
 pip install -q controlnet-aux
 
 # Try to install xformers for memory efficiency (optional)
-pip install -q xformers 2>/dev/null || echo "⚠️  xformers not installed (optional)"
+# pip install -q xformers 2>/dev/null || echo "⚠️  xformers not installed (optional)"
 
 # Create directories
 mkdir -p input_images
