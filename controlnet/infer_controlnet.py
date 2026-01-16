@@ -160,45 +160,49 @@ def generate_images(
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
     
     # =========================================
+    # VRAM Debug Helper
+    # =========================================
+    def print_vram(label=""):
+        if device == "cuda":
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"   📊 VRAM [{label}]: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+    
+    # =========================================
     # STEP 3: Apply memory optimizations
     # =========================================
     print("🔧 Applying memory optimizations...")
+    print_vram("Before optimizations")
     
     if low_vram_mode and device == "cuda":
-        # AGGRESSIVE MEMORY SAVING for P100 (16GB)
-        # Techniques from DreamBooth training script
-        print("   ⚡ LOW VRAM MODE ENABLED (DreamBooth optimizations)")
+        # BALANCED MODE: Use GPU but with memory optimizations
+        print("   ⚡ LOW VRAM MODE: GPU with smart memory management")
         
-        # 1. Enable gradient checkpointing on UNet (trades compute for memory)
-        pipe.unet.enable_gradient_checkpointing()
-        print("   ✅ UNet gradient checkpointing enabled")
+        # Move to GPU first
+        pipe = pipe.to(device)
+        print_vram("After moving to GPU")
         
-        # 2. Enable sequential CPU offload (most aggressive, moves layers to CPU)
-        pipe.enable_sequential_cpu_offload()
-        print("   ✅ Sequential CPU offload enabled")
+        # 1. Enable attention slicing (reduces memory during attention)
+        pipe.enable_attention_slicing("auto")
+        print("   ✅ Attention slicing enabled")
         
-        # 3. Enable attention slicing (reduces memory during attention computation)
-        pipe.enable_attention_slicing(1)  # slice_size=1 for minimum memory
-        print("   ✅ Attention slicing enabled (slice_size=1)")
-        
-        # 4. Enable VAE slicing (reduces memory during VAE decode)
+        # 2. Enable VAE slicing (reduces memory during VAE decode)
         pipe.enable_vae_slicing()
         print("   ✅ VAE slicing enabled")
         
-        # 5. Enable VAE tiling (for processing large images in tiles)
-        pipe.enable_vae_tiling()
-        print("   ✅ VAE tiling enabled")
-        
-        # 6. Try xformers on top of other optimizations
+        # 3. Try xformers (best memory efficiency if available)
         try:
             pipe.unet.enable_xformers_memory_efficient_attention()
             print("   ✅ xformers memory efficient attention enabled")
-        except Exception:
-            pass  # Already using attention slicing as fallback
+        except Exception as e:
+            print(f"   ⚠️  xformers not available: {e}")
+        
+        print_vram("After optimizations")
             
     elif device == "cuda":
         # Standard optimizations
         pipe = pipe.to(device)
+        print_vram("After moving to GPU")
         
         # Try xformers first, fall back to attention slicing
         try:
@@ -212,6 +216,7 @@ def generate_images(
         # Enable VAE slicing for lower memory during decode
         pipe.enable_vae_slicing()
         print("   ✅ VAE slicing enabled")
+        print_vram("After optimizations")
     else:
         pipe = pipe.to(device)
     
@@ -231,6 +236,7 @@ def generate_images(
     all_images = []
     for i in range(num_images):
         print(f"\n⏳ Generating image {i + 1}/{num_images}...")
+        print_vram("Before generation")
         
         try:
             image = pipe(
@@ -245,6 +251,8 @@ def generate_images(
                 generator=generator,
             ).images[0]
             
+            print_vram("After generation")
+            
             # Save image
             filename = f"controlnet_output_{i:04d}.png"
             filepath = os.path.join(output_dir, filename)
@@ -252,10 +260,11 @@ def generate_images(
             all_images.append((prompt, image, filepath))
             print(f"✅ Saved: {filepath}")
             
-            # Clear VRAM after each image (DreamBooth technique)
-            if device == "cuda" and low_vram_mode:
+            # Clear VRAM after each image
+            if device == "cuda":
                 torch.cuda.empty_cache()
                 gc.collect()
+                print_vram("After cache clear")
             
         except Exception as e:
             print(f"❌ Error generating image {i + 1}: {e}")

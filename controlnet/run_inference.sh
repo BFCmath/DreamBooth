@@ -12,8 +12,8 @@ echo "========================================="
 echo "📦 Installing dependencies..."
 
 # CRITICAL: Uninstall xformers - it's incompatible with Kaggle's PyTorch and causes import errors
-echo "🔧 Removing incompatible xformers..."
-pip uninstall -y xformers 2>/dev/null || true
+# echo "🔧 Removing incompatible xformers..."
+# pip uninstall -y xformers 2>/dev/null || true
 
 pip install -q controlnet-aux
 
@@ -48,8 +48,8 @@ NUM_IMAGES="${NUM_IMAGES:-1}"
 NUM_STEPS="${NUM_STEPS:-30}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-7.5}"
 CONTROLNET_SCALE="${CONTROLNET_SCALE:-1.0}"
-HEIGHT="${HEIGHT:-384}"
-WIDTH="${WIDTH:-384}"
+HEIGHT="${HEIGHT:-512}"
+WIDTH="${WIDTH:-512}"
 SEED="${SEED:-42}"
 
 # Set to "true" to use input image as pose directly (skip pose extraction)
