@@ -45,12 +45,12 @@ MODEL_PATH="${MODEL_PATH:-runwayml/stable-diffusion-v1-5}"
 CONTROLNET_MODEL="${CONTROLNET_MODEL:-lllyasviel/control_v11p_sd15_openpose}"
 
 # Generation parameters
-NUM_IMAGES="${NUM_IMAGES:-4}"
+NUM_IMAGES="${NUM_IMAGES:-1}
 NUM_STEPS="${NUM_STEPS:-30}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-7.5}"
 CONTROLNET_SCALE="${CONTROLNET_SCALE:-1.0}"
-HEIGHT="${HEIGHT:-512}"
-WIDTH="${WIDTH:-512}"
+HEIGHT="${HEIGHT:-384}"
+WIDTH="${WIDTH:-384}"
 SEED="${SEED:-42}"
 
 # Set to "true" to use input image as pose directly (skip pose extraction)
