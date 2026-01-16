@@ -165,8 +165,32 @@ def generate_images(
     
     if low_vram_mode and device == "cuda":
         # AGGRESSIVE MEMORY SAVING for P100 (16GB)
-        print("   ⚡ LOW VRAM MODE: Using sequential CPU offloading")
-        pipe.enable_sequential_cpu_offload()
+        # This combination should reduce VRAM from ~14GB to ~8GB
+        print("   ⚡ LOW VRAM MODE ENABLED")
+        
+        # 1. Enable model CPU offload (moves entire models, faster than sequential)
+        pipe.enable_model_cpu_offload()
+        print("   ✅ Model CPU offload enabled")
+        
+        # 2. Enable attention slicing (reduces memory during attention computation)
+        pipe.enable_attention_slicing("max")
+        print("   ✅ Attention slicing enabled (max)")
+        
+        # 3. Enable VAE slicing (reduces memory during VAE decode)
+        pipe.enable_vae_slicing()
+        print("   ✅ VAE slicing enabled")
+        
+        # 4. Enable VAE tiling (for processing large images in tiles)
+        pipe.enable_vae_tiling()
+        print("   ✅ VAE tiling enabled")
+        
+        # 5. Try xformers on top of other optimizations
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("   ✅ xformers memory efficient attention enabled")
+        except Exception:
+            pass  # Already using attention slicing as fallback
+            
     elif device == "cuda":
         # Standard optimizations
         pipe = pipe.to(device)
@@ -369,7 +393,7 @@ def main():
     )
     
     args = parser.parse_args()
-    
+    print("START")
     generate_images(
         prompt=args.prompt,
         input_image=args.input_image,

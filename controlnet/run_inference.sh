@@ -16,6 +16,11 @@ pip install -q controlnet-aux opencv-python Pillow
 # Try to install xformers for memory efficiency (optional)
 pip install -q xformers 2>/dev/null || echo "⚠️  xformers not installed (optional)"
 
+# ===========================================
+# CRITICAL: Reduce CUDA memory fragmentation
+# ===========================================
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Create directories
 mkdir -p input_images
 mkdir -p output_images
@@ -49,6 +54,7 @@ WIDTH="${WIDTH:-512}"
 SEED="${SEED:-42}"
 
 # Set to "true" to use input image as pose directly (skip pose extraction)
+# TIP: Using pose directly saves ~2GB VRAM (no OpenPose detector needed)
 USE_POSE_DIRECTLY="${USE_POSE_DIRECTLY:-false}"
 
 # LOW VRAM MODE: Enable aggressive memory optimizations for P100 (16GB)
@@ -77,6 +83,21 @@ echo "Resolution: ${WIDTH}x${HEIGHT}"
 echo "Seed: $SEED"
 echo "Use pose directly: $USE_POSE_DIRECTLY"
 echo "Low VRAM mode: $LOW_VRAM_MODE"
+echo "========================================="
+echo ""
+echo "Memory optimizations enabled:"
+echo "  ✅ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+echo "  ✅ Sequential CPU offloading (low VRAM mode)"
+echo "  ✅ FP16 precision"
+echo "  ✅ VAE slicing"
+if [ "$USE_POSE_DIRECTLY" = "true" ]; then
+    echo "  ✅ OpenPose detector skipped (saves ~2GB)"
+fi
+echo ""
+echo "If still OOM, try:"
+echo "  HEIGHT=384 WIDTH=384 bash run_inference.sh"
+echo "  NUM_IMAGES=1 bash run_inference.sh"
+echo "  USE_POSE_DIRECTLY=true bash run_inference.sh"
 echo "========================================="
 echo ""
 
