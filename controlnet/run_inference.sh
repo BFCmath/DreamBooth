@@ -10,11 +10,8 @@ echo "========================================="
 
 # Install dependencies (skip torch to avoid conflicts with Kaggle's preinstalled version)
 echo "📦 Installing dependencies..."
-pip install -q diffusers transformers accelerate huggingface_hub
-pip install -q controlnet-aux opencv-python Pillow
+pip install -q controlnet-aux 
 
-# Try to install xformers for memory efficiency (optional)
-pip install -q xformers 2>/dev/null || echo "⚠️  xformers not installed (optional)"
 
 # ===========================================
 # CRITICAL: Reduce CUDA memory fragmentation
