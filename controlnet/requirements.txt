@@ -1,0 +1,10 @@
+# ControlNet Inference Dependencies
+# Compatible with Kaggle P100 environment
+
+diffusers>=0.25.0
+transformers>=4.35.0
+accelerate
+controlnet-aux>=0.0.7
+opencv-python
+Pillow
+huggingface_hub
