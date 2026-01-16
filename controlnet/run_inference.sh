@@ -10,10 +10,15 @@ echo "========================================="
 
 # Install dependencies (skip torch to avoid conflicts with Kaggle's preinstalled version)
 echo "📦 Installing dependencies..."
+
+# CRITICAL: Uninstall xformers - it's incompatible with Kaggle's PyTorch and causes import errors
+echo "🔧 Removing incompatible xformers..."
+pip uninstall -y xformers 2>/dev/null || true
+
 pip install -q controlnet-aux
 
-# Try to install xformers for memory efficiency (optional)
-# pip install -q xformers 2>/dev/null || echo "⚠️  xformers not installed (optional)"
+# Do NOT install xformers - it conflicts with Kaggle's PyTorch version
+# The script will use attention slicing instead
 
 # Create directories
 mkdir -p input_images
