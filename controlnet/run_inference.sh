@@ -39,7 +39,7 @@ MODEL_PATH="${MODEL_PATH:-runwayml/stable-diffusion-v1-5}"
 CONTROLNET_MODEL="${CONTROLNET_MODEL:-lllyasviel/control_v11p_sd15_openpose}"
 
 # Generation parameters
-NUM_IMAGES="${NUM_IMAGES:-1}
+NUM_IMAGES="${NUM_IMAGES:-1}"
 NUM_STEPS="${NUM_STEPS:-30}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-7.5}"
 CONTROLNET_SCALE="${CONTROLNET_SCALE:-1.0}"
