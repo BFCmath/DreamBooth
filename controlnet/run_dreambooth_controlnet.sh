@@ -47,13 +47,13 @@ PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-1.0}"
 NUM_CLASS_IMAGES="${NUM_CLASS_IMAGES:-100}"
 SAMPLE_BATCH_SIZE="${SAMPLE_BATCH_SIZE:-4}"  # Batch size for class image generation (increase to use more GPU)
 
-# Training Config (optimized for identity learning)
-LEARNING_RATE="${LEARNING_RATE:-5e-6}"        # Lower LR for identity
-MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-800}"     # More steps for small dataset
+# Training Config (optimized for fine-tuning pretrained ControlNet)
+LEARNING_RATE="${LEARNING_RATE:-1e-6}"        # Lower LR for fine-tuning
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-400}"     # Fewer steps for fine-tuning
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-4}"
 RESOLUTION="${RESOLUTION:-512}"
-REPEATS="${REPEATS:-100}"                      # Repeat instance images
+REPEATS="${REPEATS:-20}"                       # Repeat instance images
 CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-200}"
 
 # Memory Optimization
@@ -61,8 +61,9 @@ GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 USE_8BIT_ADAM="${USE_8BIT_ADAM:-true}"
 MIXED_PRECISION="${MIXED_PRECISION:-true}"
 
-# Optional: Load from existing ControlNet checkpoint
-# export CONTROLNET_MODEL="lllyasviel/control_v11p_sd15_openpose"
+# Pretrained ControlNet to fine-tune (required)
+CONTROLNET_MODEL="${CONTROLNET_MODEL:-lllyasviel/control_v11p_sd15_openpose}"
+export CONTROLNET_MODEL
 
 # =============================================
 # Validation
@@ -115,6 +116,10 @@ echo "   Prior preservation: $WITH_PRIOR_PRESERVATION"
 echo "   Prior loss weight: $PRIOR_LOSS_WEIGHT"
 echo "   Num class images: $NUM_CLASS_IMAGES"
 echo "   Class gen batch size: $SAMPLE_BATCH_SIZE (increase to use more GPU during generation)"
+echo ""
+echo "🎯 ControlNet Fine-tuning:"
+echo "   Pretrained model: $CONTROLNET_MODEL"
+echo "   UNet: FROZEN (not trained)"
 echo ""
 echo "🔧 Training:"
 echo "   Learning rate: $LEARNING_RATE"

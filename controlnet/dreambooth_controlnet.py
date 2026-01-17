@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
 DreamBooth + ControlNet Fine-tuning Script for Stable Diffusion 1.5
-Combines ControlNet conditioning with DreamBooth identity-oriented fine-tuning.
+Fine-tunes a PRETRAINED ControlNet with DreamBooth identity learning.
 
-This script enables training a ControlNet that is optimized for a specific identity
-using the DreamBooth technique (rare token identifier + prior preservation).
+This script enables fine-tuning an existing ControlNet (e.g., OpenPose) to be 
+optimized for a specific identity using DreamBooth technique.
+
+Key concepts:
+- Uses a PRETRAINED ControlNet (e.g., lllyasviel/control_v11p_sd15_openpose)
+- UNet is FROZEN - only ControlNet is trained
+- DreamBooth rare token (sks) binds identity to the ControlNet
+- Prior preservation prevents catastrophic forgetting
 
 Based on:
 - diffusers ControlNet training: https://github.com/huggingface/diffusers/blob/main/examples/controlnet/train_controlnet.py
@@ -14,26 +20,23 @@ Dataset Structure Required:
     data/
     ├── instance_images/      # Instance images (the identity you want to learn)
     │   ├── 001.png
-    │   ├── 002.png
     │   └── ...
-    ├── conditioning/         # Conditioning images (pose/edges/etc) for instance
+    ├── conditioning/         # Conditioning images (pose/edges) for each instance
     │   ├── 001.png           # Must match instance image names
-    │   ├── 002.png
     │   └── ...
-    ├── class_images/         # Optional: class images for prior preservation
-    │   ├── 001.png           # Will be auto-generated if not enough exist
-    │   └── ...
-    ├── class_conditioning/   # Optional: conditioning images for class images
-    │   ├── 001.png
-    │   └── ...
-    └── prompts.txt           # Optional: One prompt per line (overrides default prompts)
+    └── prompts.txt           # Optional: One prompt per line
 
-Key Hyperparameters for Identity Training (from DreamBooth):
-- instance_prompt: "a photo of sks person" (sks is the rare token identifier)
-- class_prompt: "a photo of person" (for prior preservation)
-- learning_rate: 1e-5 to 5e-6 (lower than standard ControlNet training)
-- max_train_steps: 400-1000 (depending on number of instance images)
-- prior_loss_weight: 1.0 (balance between identity and general knowledge)
+Key Hyperparameters for Fine-tuning:
+- CONTROLNET_MODEL: Pretrained ControlNet to fine-tune (required)
+- instance_prompt: "a photo of sks cat" (sks is the rare token identifier)
+- class_prompt: "a photo of cat" (for prior preservation)
+- learning_rate: 1e-6 (very low for fine-tuning)
+- max_train_steps: 200-400 (small dataset, pretrained model)
+- repeats: 10-20 (repeat instance images)
+
+Environment Variables:
+    CONTROLNET_MODEL: Path or HuggingFace ID of pretrained ControlNet
+                     Default: lllyasviel/control_v11p_sd15_openpose
 """
 
 import argparse
@@ -367,14 +370,14 @@ def train(
     resolution: int = 512,
     train_batch_size: int = 1,
     gradient_accumulation_steps: int = 4,
-    learning_rate: float = 5e-6,  # Lower LR for identity preservation
-    max_train_steps: int = 800,
+    learning_rate: float = 1e-6,  # Lower LR for fine-tuning pretrained ControlNet
+    max_train_steps: int = 400,
     checkpointing_steps: int = 200,
     mixed_precision: bool = True,
     gradient_checkpointing: bool = True,
     use_8bit_adam: bool = True,
     seed: int = 42,
-    repeats: int = 100,  # Repeat instance images to match class images
+    repeats: int = 20,  # Repeat instance images
 ):
     """
     Train a ControlNet model with DreamBooth technique for identity-oriented generation.
@@ -511,17 +514,13 @@ def train(
     print("Phase 3: Initializing ControlNet")
     print("=" * 60)
     
-    # Check if we should load from existing ControlNet or initialize from UNet
-    controlnet_path = os.environ.get("CONTROLNET_MODEL", None)
+    # Load pretrained ControlNet (required for fine-tuning)
+    controlnet_model = os.environ.get("CONTROLNET_MODEL", "lllyasviel/control_v11p_sd15_openpose")
     
-    if controlnet_path:
-        print(f"   📂 Loading from checkpoint: {controlnet_path}")
-        controlnet = ControlNetModel.from_pretrained(controlnet_path)
-        print("   ✅ ControlNet loaded from checkpoint (fine-tuning mode)")
-    else:
-        print("   🆕 Initializing from UNet encoder (training from scratch)")
-        controlnet = ControlNetModel.from_unet(unet)
-        print("   ✅ ControlNet initialized from UNet")
+    print(f"   📂 Loading pretrained ControlNet: {controlnet_model}")
+    controlnet = ControlNetModel.from_pretrained(controlnet_model)
+    print("   ✅ ControlNet loaded (fine-tuning mode)")
+    print("   ℹ️  UNet is FROZEN - only ControlNet will be trained")
     
     controlnet.to(device)  # Keep in float32 for training stability
     
@@ -785,12 +784,12 @@ def main():
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--learning_rate", type=float, default=5e-6,
-                       help="Learning rate (lower for identity preservation)")
-    parser.add_argument("--max_train_steps", type=int, default=800)
+    parser.add_argument("--learning_rate", type=float, default=1e-6,
+                       help="Learning rate (very low for fine-tuning pretrained ControlNet)")
+    parser.add_argument("--max_train_steps", type=int, default=400)
     parser.add_argument("--checkpointing_steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--repeats", type=int, default=100,
+    parser.add_argument("--repeats", type=int, default=20,
                        help="Times to repeat instance images")
     
     # Optimization flags
