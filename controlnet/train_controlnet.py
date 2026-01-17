@@ -248,12 +248,25 @@ def train(
     print_vram("After loading frozen models")
     
     # =========================================
-    # Initialize ControlNet from UNet
+    # Initialize ControlNet
     # =========================================
-    print("⏳ Initializing ControlNet from UNet...")
-    controlnet = ControlNetModel.from_unet(unet)
+    print("⏳ Initializing ControlNet...")
+    
+    # Check if we should load from existing ControlNet or initialize from UNet
+    controlnet_path = os.environ.get("CONTROLNET_MODEL", None)
+    
+    if controlnet_path:
+        # Fine-tune from existing ControlNet checkpoint
+        print(f"   📂 Loading from checkpoint: {controlnet_path}")
+        controlnet = ControlNetModel.from_pretrained(controlnet_path)
+        print("   ✅ ControlNet loaded from checkpoint (fine-tuning mode)")
+    else:
+        # Train from scratch - initialize from UNet encoder
+        print("   🆕 Initializing from UNet encoder (training from scratch)")
+        controlnet = ControlNetModel.from_unet(unet)
+        print("   ✅ ControlNet initialized from UNet")
+    
     controlnet.to(device)  # Keep in float32 for training stability
-    print("   ✅ ControlNet initialized")
     
     if gradient_checkpointing:
         controlnet.enable_gradient_checkpointing()

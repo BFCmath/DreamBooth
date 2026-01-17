@@ -32,6 +32,14 @@ OUTPUT_DIR="${OUTPUT_DIR:-./output/controlnet-finetuned}"
 # Base model
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-runwayml/stable-diffusion-v1-5}"
 
+# ControlNet Model (optional - for fine-tuning from existing checkpoint)
+# Set this to fine-tune from a pre-trained ControlNet instead of training from scratch
+# Examples:
+#   CONTROLNET_MODEL="lllyasviel/control_v11p_sd15_openpose"  # Fine-tune OpenPose ControlNet
+#   CONTROLNET_MODEL="./output/controlnet-finetuned"          # Continue from previous training
+#   (leave empty to train from scratch using UNet encoder)
+export CONTROLNET_MODEL="${CONTROLNET_MODEL:-}"
+
 # Training parameters
 RESOLUTION="${RESOLUTION:-512}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
@@ -50,6 +58,11 @@ echo "========================================="
 echo "Data directory: $DATA_DIR"
 echo "Output directory: $OUTPUT_DIR"
 echo "Base model: $PRETRAINED_MODEL"
+if [ -n "$CONTROLNET_MODEL" ]; then
+    echo "ControlNet: $CONTROLNET_MODEL (fine-tuning)"
+else
+    echo "ControlNet: (training from scratch)"
+fi
 echo "Resolution: $RESOLUTION"
 echo "Batch size: $TRAIN_BATCH_SIZE"
 echo "Gradient accumulation: $GRADIENT_ACCUMULATION"
