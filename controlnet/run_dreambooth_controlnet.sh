@@ -45,6 +45,7 @@ CLASS_PROMPT="${CLASS_PROMPT:-a photo of person}"
 WITH_PRIOR_PRESERVATION="${WITH_PRIOR_PRESERVATION:-true}"
 PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-1.0}"
 NUM_CLASS_IMAGES="${NUM_CLASS_IMAGES:-100}"
+SAMPLE_BATCH_SIZE="${SAMPLE_BATCH_SIZE:-4}"  # Batch size for class image generation (increase to use more GPU)
 
 # Training Config (optimized for identity learning)
 LEARNING_RATE="${LEARNING_RATE:-5e-6}"        # Lower LR for identity
@@ -113,6 +114,7 @@ echo "   Class prompt: $CLASS_PROMPT"
 echo "   Prior preservation: $WITH_PRIOR_PRESERVATION"
 echo "   Prior loss weight: $PRIOR_LOSS_WEIGHT"
 echo "   Num class images: $NUM_CLASS_IMAGES"
+echo "   Class gen batch size: $SAMPLE_BATCH_SIZE (increase to use more GPU during generation)"
 echo ""
 echo "🔧 Training:"
 echo "   Learning rate: $LEARNING_RATE"
@@ -152,6 +154,7 @@ python dreambooth_controlnet.py \
     $(if [ "$WITH_PRIOR_PRESERVATION" = "true" ]; then echo "--with_prior_preservation"; fi) \
     --prior_loss_weight=$PRIOR_LOSS_WEIGHT \
     --num_class_images=$NUM_CLASS_IMAGES \
+    --sample_batch_size=$SAMPLE_BATCH_SIZE \
     --resolution=$RESOLUTION \
     --train_batch_size=$TRAIN_BATCH_SIZE \
     --gradient_accumulation_steps=$GRADIENT_ACCUMULATION \

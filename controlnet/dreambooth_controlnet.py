@@ -285,10 +285,14 @@ def generate_class_images(
     pretrained_model: str,
     controlnet_path: str = None,
     device: str = "cuda",
+    sample_batch_size: int = 4,  # Generate 4 images at a time for speed
 ):
     """
     Generate class images for prior preservation.
     Uses the base SD model (optionally with ControlNet) to generate diverse class images.
+    
+    Args:
+        sample_batch_size: Number of images to generate per batch (increase to use more GPU)
     """
     class_dir = Path(class_images_dir)
     class_dir.mkdir(parents=True, exist_ok=True)
@@ -303,6 +307,7 @@ def generate_class_images(
     
     num_to_generate = num_class_images - cur_class_images
     print(f"📸 Generating {num_to_generate} class images with prompt: '{class_prompt}'")
+    print(f"   Batch size: {sample_batch_size} (adjust SAMPLE_BATCH_SIZE to use more GPU)")
     
     from diffusers import StableDiffusionPipeline
     
@@ -314,15 +319,28 @@ def generate_class_images(
     pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     
-    for i in tqdm(range(num_to_generate), desc="Generating class images"):
-        image = pipeline(
-            class_prompt,
+    # Generate in batches for speed
+    num_batches = (num_to_generate + sample_batch_size - 1) // sample_batch_size
+    generated = 0
+    
+    for batch_idx in tqdm(range(num_batches), desc="Generating class images"):
+        # Calculate how many images to generate in this batch
+        remaining = num_to_generate - generated
+        batch_count = min(sample_batch_size, remaining)
+        
+        # Generate batch
+        images = pipeline(
+            [class_prompt] * batch_count,
             num_inference_steps=25,
             guidance_scale=7.5,
-        ).images[0]
+        ).images
         
-        image_path = class_dir / f"class_{cur_class_images + i:04d}.png"
-        image.save(image_path)
+        # Save each image
+        for i, image in enumerate(images):
+            image_path = class_dir / f"class_{cur_class_images + generated + i:04d}.png"
+            image.save(image_path)
+        
+        generated += batch_count
     
     del pipeline
     torch.cuda.empty_cache()
@@ -344,6 +362,7 @@ def train(
     with_prior_preservation: bool = True,
     prior_loss_weight: float = 1.0,
     num_class_images: int = 100,
+    sample_batch_size: int = 4,  # Batch size for generating class images
     # Training parameters
     resolution: int = 512,
     train_batch_size: int = 1,
@@ -445,6 +464,7 @@ def train(
             num_class_images=num_class_images,
             pretrained_model=pretrained_model,
             device=device,
+            sample_batch_size=sample_batch_size,
         )
         print()
     
@@ -758,6 +778,8 @@ def main():
                        help="Weight of prior preservation loss")
     parser.add_argument("--num_class_images", type=int, default=100,
                        help="Number of class images for prior preservation")
+    parser.add_argument("--sample_batch_size", type=int, default=4,
+                       help="Batch size for class image generation (increase to use more GPU)")
     
     # Training parameters
     parser.add_argument("--resolution", type=int, default=512)
@@ -787,6 +809,7 @@ def main():
         with_prior_preservation=args.with_prior_preservation,
         prior_loss_weight=args.prior_loss_weight,
         num_class_images=args.num_class_images,
+        sample_batch_size=args.sample_batch_size,
         resolution=args.resolution,
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
