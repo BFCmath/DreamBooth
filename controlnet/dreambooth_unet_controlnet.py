@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-DreamBooth + ControlNet Fine-tuning Script for Stable Diffusion 1.5
-Fine-tunes a PRETRAINED ControlNet with DreamBooth identity learning.
+DreamBooth + ControlNet Training Script (UNet Training Mode)
 
-This script enables fine-tuning an existing ControlNet (e.g., OpenPose) to be 
-optimized for a specific identity using DreamBooth technique.
+This script trains the UNet for identity learning while using a FROZEN pretrained
+ControlNet for structural conditioning. This is the CORRECT approach for 
+identity-oriented fine-tuning with ControlNet.
 
-Key concepts:
-- Uses a PRETRAINED ControlNet (e.g., lllyasviel/control_v11p_sd15_openpose)
-- UNet is FROZEN - only ControlNet is trained
-- DreamBooth rare token (sks) binds identity to the ControlNet
-- Prior preservation prevents catastrophic forgetting
+Key difference from dreambooth_controlnet.py:
+- UNet is TRAINED (identity learning happens here)
+- ControlNet is FROZEN (only provides structural conditioning)
+
+This approach:
+1. Preserves the base ControlNet's conditioning capabilities
+2. Allows UNet to learn the specific identity (sks token binding)
+3. Uses prior preservation to prevent catastrophic forgetting
 
 Based on:
-- diffusers ControlNet training: https://github.com/huggingface/diffusers/blob/main/examples/controlnet/train_controlnet.py
 - DreamBooth paper: https://arxiv.org/abs/2208.12242
+- ControlNet paper: https://arxiv.org/abs/2302.05543
 
 Dataset Structure Required:
     data/
@@ -26,17 +29,11 @@ Dataset Structure Required:
     │   └── ...
     └── prompts.txt           # Optional: One prompt per line
 
-Key Hyperparameters for Fine-tuning:
-- CONTROLNET_MODEL: Pretrained ControlNet to fine-tune (required)
+Key Hyperparameters:
 - instance_prompt: "a photo of sks cat" (sks is the rare token identifier)
 - class_prompt: "a photo of cat" (for prior preservation)
-- learning_rate: 1e-6 (very low for fine-tuning)
-- max_train_steps: 200-400 (small dataset, pretrained model)
-- repeats: 10-20 (repeat instance images)
-
-Environment Variables:
-    CONTROLNET_MODEL: Path or HuggingFace ID of pretrained ControlNet
-                     Default: lllyasviel/control_v11p_sd15_openpose
+- learning_rate: 5e-6 (standard DreamBooth LR)
+- max_train_steps: 400-800 (typical for DreamBooth)
 """
 
 import argparse
@@ -68,21 +65,11 @@ from transformers import CLIPTextModel, CLIPTokenizer
 # =============================================================================
 class DreamBoothControlNetDataset(Dataset):
     """
-    Dataset for DreamBooth-style ControlNet training.
+    Dataset for DreamBooth-style training with ControlNet conditioning.
     
     Combines:
     - Instance images (the specific identity to learn) with conditioning
     - Class images (for prior preservation) with conditioning
-    
-    Expects:
-    - instance_images_dir: directory with instance images (001.png, 002.png, ...)
-    - conditioning_dir: directory with conditioning images (same names as instance)
-    - instance_prompt: prompt with rare identifier (e.g., "a photo of sks person")
-    
-    Optional for prior preservation:
-    - class_images_dir: directory with class images
-    - class_conditioning_dir: directory with class conditioning images
-    - class_prompt: prompt for class images (e.g., "a photo of person")
     """
     
     def __init__(
@@ -104,7 +91,7 @@ class DreamBoothControlNetDataset(Dataset):
         self.tokenizer = tokenizer
         self.resolution = resolution
         
-        # Load optional prompts file (overrides instance_prompt if provided)
+        # Load optional prompts file
         self.prompts = None
         if prompts_file and os.path.exists(prompts_file):
             with open(prompts_file, "r") as f:
@@ -200,7 +187,7 @@ class DreamBoothControlNetDataset(Dataset):
         example["instance_pixel_values"] = pixel_values
         example["instance_conditioning"] = conditioning_pixel_values
         
-        # Get prompt (from file or default instance_prompt)
+        # Get prompt
         if self.prompts is not None and instance_idx < len(self.prompts):
             prompt = self.prompts[instance_idx]
         else:
@@ -219,7 +206,6 @@ class DreamBoothControlNetDataset(Dataset):
             class_idx = idx % self.num_class_images
             class_path = self.class_images[class_idx]
             
-            # MUST use class_conditioning_dir for proper (image, conditioning) pairs
             if self.class_conditioning_dir is None:
                 raise ValueError(
                     "Prior preservation requires class_conditioning_dir! "
@@ -285,16 +271,6 @@ def print_vram(label=""):
 def extract_conditioning(image_np, conditioning_type: str):
     """
     Extract conditioning from an image based on the specified type.
-    
-    Args:
-        image_np: RGB numpy array (H, W, 3)
-        conditioning_type: Type of conditioning to extract
-            - "canny": Canny edge detection
-            - "hed": HED-style soft edges (approximated with dilated Canny)
-            - "none": Return None (user provides conditioning separately)
-    
-    Returns:
-        RGB numpy array of conditioning image, or None if type is "none"
     """
     import cv2
     import numpy as np
@@ -305,7 +281,6 @@ def extract_conditioning(image_np, conditioning_type: str):
         return cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
     
     elif conditioning_type == "hed":
-        # HED-style soft edges (approximated with dilated Canny)
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
         edges = cv2.Canny(gray, 50, 150)
         kernel = np.ones((3, 3), np.uint8)
@@ -316,10 +291,7 @@ def extract_conditioning(image_np, conditioning_type: str):
         return None
     
     else:
-        raise ValueError(
-            f"Unknown conditioning_type: {conditioning_type}. "
-            f"Supported types: canny, hed, none"
-        )
+        raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
 
 
 # =============================================================================
@@ -331,26 +303,11 @@ def generate_class_images(
     class_prompt: str,
     num_class_images: int,
     pretrained_model: str,
-    conditioning_type: str = "canny",  # Configurable conditioning type
-    controlnet_path: str = None,
+    conditioning_type: str = "canny",
     device: str = "cuda",
     sample_batch_size: int = 4,
 ):
-    """
-    Generate class images AND their conditioning for prior preservation.
-    
-    This ensures proper (image, conditioning) pairs for the prior loss calculation.
-    Without matching conditioning, the prior loss would use mismatched pairs.
-    
-    Args:
-        class_images_dir: Directory to save generated class images
-        class_conditioning_dir: Directory to save conditioning for class images
-        class_prompt: Prompt to generate class images
-        num_class_images: Number of class images to generate
-        pretrained_model: Base SD model for generation
-        conditioning_type: Type of conditioning to extract (canny, hed, none)
-        sample_batch_size: Number of images to generate per batch
-    """
+    """Generate class images AND their conditioning for prior preservation."""
     import cv2
     import numpy as np
     
@@ -365,19 +322,15 @@ def generate_class_images(
     cur_class_images = len(existing_images)
     
     if cur_class_images >= num_class_images:
-        # Also check if conditioning exists
         existing_cond = list(cond_dir.glob("*.png")) + list(cond_dir.glob("*.jpg"))
         if len(existing_cond) >= num_class_images:
-            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning (needed {num_class_images})")
+            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning")
             return
     
     num_to_generate = num_class_images - cur_class_images
     print(f"📸 Generating {num_to_generate} class images with prompt: '{class_prompt}'")
     if conditioning_type != "none":
         print(f"   Also extracting {conditioning_type} conditioning for each class image")
-    else:
-        print(f"   Skipping conditioning extraction (user provides pre-made conditioning)")
-    print(f"   Batch size: {sample_batch_size} (adjust SAMPLE_BATCH_SIZE to use more GPU)")
     
     from diffusers import StableDiffusionPipeline
     
@@ -389,35 +342,28 @@ def generate_class_images(
     pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     
-    # Generate in batches for speed
     num_batches = (num_to_generate + sample_batch_size - 1) // sample_batch_size
     generated = 0
     
-    for batch_idx in tqdm(range(num_batches), desc="Generating class images + conditioning"):
-        # Calculate how many images to generate in this batch
+    for batch_idx in tqdm(range(num_batches), desc="Generating class images"):
         remaining = num_to_generate - generated
         batch_count = min(sample_batch_size, remaining)
         
-        # Generate batch
         images = pipeline(
             [class_prompt] * batch_count,
             num_inference_steps=25,
             guidance_scale=7.5,
         ).images
         
-        # Save each image AND extract conditioning
         for i, image in enumerate(images):
             idx = cur_class_images + generated + i
             
-            # Save class image
             image_path = class_dir / f"class_{idx:04d}.png"
             image.save(image_path)
             
-            # Extract and save conditioning (based on conditioning_type)
             if conditioning_type != "none":
                 image_np = np.array(image)
                 cond_rgb = extract_conditioning(image_np, conditioning_type)
-                
                 cond_path = cond_dir / f"class_{idx:04d}.png"
                 Image.fromarray(cond_rgb).save(cond_path)
         
@@ -431,72 +377,53 @@ def generate_class_images(
 
 
 # =============================================================================
-# Training Function
+# Training Function - TRAINS UNET (not ControlNet)
 # =============================================================================
 def train(
     data_dir: str = "./data",
-    output_dir: str = "./output/controlnet-dreambooth",
+    output_dir: str = "./output/dreambooth-unet-controlnet",
     pretrained_model: str = "runwayml/stable-diffusion-v1-5",
+    controlnet_model: str = "lllyasviel/control_v11p_sd15_canny",
     # DreamBooth-specific parameters
-    instance_prompt: str = "a photo of sks person",
-    class_prompt: str = "a photo of person",
+    instance_prompt: str = "a photo of sks cat",
+    class_prompt: str = "a photo of cat",
     with_prior_preservation: bool = True,
     prior_loss_weight: float = 1.0,
     num_class_images: int = 100,
     sample_batch_size: int = 4,
-    conditioning_type: str = "canny",  # Type of conditioning for class images
+    conditioning_type: str = "canny",
     # Training parameters
     resolution: int = 512,
     train_batch_size: int = 1,
     gradient_accumulation_steps: int = 4,
-    learning_rate: float = 1e-6,  # Lower LR for fine-tuning pretrained ControlNet
-    max_train_steps: int = 400,
+    learning_rate: float = 5e-6,  # Standard DreamBooth LR for UNet
+    max_train_steps: int = 800,
     checkpointing_steps: int = 200,
     mixed_precision: bool = True,
     gradient_checkpointing: bool = True,
     use_8bit_adam: bool = True,
     seed: int = 42,
-    repeats: int = 20,  # Repeat instance images
+    repeats: int = 20,
 ):
     """
-    Train a ControlNet model with DreamBooth technique for identity-oriented generation.
+    Train UNet with DreamBooth technique using frozen ControlNet for conditioning.
     
-    This combines:
-    1. ControlNet conditioning (pose, edges, etc.)
-    2. DreamBooth identity learning (rare token + prior preservation)
-    
-    Args:
-        data_dir: Directory containing instance_images/, conditioning/, etc.
-        output_dir: Where to save the trained ControlNet
-        pretrained_model: Base SD model to use
-        
-        # DreamBooth parameters
-        instance_prompt: Prompt with rare identifier (e.g., "a photo of sks person")
-        class_prompt: General class prompt (e.g., "a photo of person")
-        with_prior_preservation: Enable prior preservation loss
-        prior_loss_weight: Weight of prior preservation loss (default 1.0)
-        num_class_images: Number of class images for prior preservation
-        
-        # Training parameters
-        resolution: Training resolution
-        train_batch_size: Batch size per device
-        gradient_accumulation_steps: Accumulate gradients for effective larger batch
-        learning_rate: Learning rate (lower for DreamBooth, e.g., 5e-6)
-        max_train_steps: Total training steps
-        checkpointing_steps: Save checkpoint every N steps
-        mixed_precision: Use FP16 for lower memory
-        gradient_checkpointing: Trade compute for memory
-        use_8bit_adam: Use 8-bit Adam for lower memory
-        seed: Random seed
-        repeats: Times to repeat instance images in dataset
+    This is the CORRECT approach for identity-oriented fine-tuning:
+    - UNet learns the identity (sks token binding)
+    - ControlNet provides structural conditioning (frozen)
     """
     
     print("=" * 60)
-    print("DreamBooth + ControlNet Fine-tuning")
+    print("DreamBooth + ControlNet (UNet Training Mode)")
     print("=" * 60)
+    print()
+    print("🔑 KEY DIFFERENCE: This trains UNET for identity learning!")
+    print("   ControlNet is FROZEN (only provides structural guidance)")
+    print()
     print(f"Data directory: {data_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Base model: {pretrained_model}")
+    print(f"ControlNet: {controlnet_model}")
     print()
     print("DreamBooth Configuration:")
     print(f"  Instance prompt: {instance_prompt}")
@@ -504,17 +431,14 @@ def train(
     print(f"  Prior preservation: {with_prior_preservation}")
     print(f"  Prior loss weight: {prior_loss_weight}")
     print(f"  Num class images: {num_class_images}")
+    print(f"  Conditioning type: {conditioning_type}")
     print()
     print("Training Configuration:")
     print(f"  Resolution: {resolution}")
     print(f"  Batch size: {train_batch_size}")
     print(f"  Gradient accumulation: {gradient_accumulation_steps}")
-    print(f"  Effective batch size: {train_batch_size * gradient_accumulation_steps}")
     print(f"  Learning rate: {learning_rate}")
     print(f"  Max steps: {max_train_steps}")
-    print(f"  Mixed precision: {mixed_precision}")
-    print(f"  Gradient checkpointing: {gradient_checkpointing}")
-    print(f"  8-bit Adam: {use_8bit_adam}")
     print(f"  Instance repeats: {repeats}")
     print("=" * 60)
     print()
@@ -547,7 +471,7 @@ def train(
             class_prompt=class_prompt,
             num_class_images=num_class_images,
             pretrained_model=pretrained_model,
-            conditioning_type=conditioning_type,  # Pass the configured type
+            conditioning_type=conditioning_type,
             device=device,
             sample_batch_size=sample_batch_size,
         )
@@ -576,57 +500,39 @@ def train(
     vae.to(device, dtype=weight_dtype)
     print("   ✅ VAE loaded (frozen)")
     
-    # UNet (frozen, used for ControlNet output)
+    # UNet (TRAINABLE - this is where identity learning happens!)
     unet = UNet2DConditionModel.from_pretrained(pretrained_model, subfolder="unet")
-    unet.requires_grad_(False)
-    unet.to(device, dtype=weight_dtype)
-    print("   ✅ UNet loaded (frozen)")
+    unet.to(device)  # Keep in float32 for training stability
+    print("   ✅ UNet loaded (TRAINABLE - identity learning)")
+    
+    # ControlNet (FROZEN - only provides structural conditioning)
+    controlnet = ControlNetModel.from_pretrained(controlnet_model)
+    controlnet.requires_grad_(False)
+    controlnet.to(device, dtype=weight_dtype)
+    print(f"   ✅ ControlNet loaded from {controlnet_model} (FROZEN)")
     
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model, subfolder="scheduler")
     print("   ✅ Noise scheduler loaded")
     
-    print_vram("After loading frozen models")
-    
-    # =========================================
-    # Initialize ControlNet
-    # =========================================
-    print()
-    print("=" * 60)
-    print("Phase 3: Initializing ControlNet")
-    print("=" * 60)
-    
-    # Load pretrained ControlNet (required for fine-tuning)
-    controlnet_model = os.environ.get("CONTROLNET_MODEL", "lllyasviel/control_v11p_sd15_openpose")
-    
-    print(f"   📂 Loading pretrained ControlNet: {controlnet_model}")
-    controlnet = ControlNetModel.from_pretrained(controlnet_model)
-    print("   ✅ ControlNet loaded (fine-tuning mode)")
-    print("   ℹ️  UNet is FROZEN - only ControlNet will be trained")
-    
-    controlnet.to(device)  # Keep in float32 for training stability
+    print_vram("After loading models")
     
     if gradient_checkpointing:
-        controlnet.enable_gradient_checkpointing()
-        print("   ✅ Gradient checkpointing enabled")
-    
-    print_vram("After ControlNet init")
+        unet.enable_gradient_checkpointing()
+        print("   ✅ UNet gradient checkpointing enabled")
     
     # =========================================
     # Dataset
     # =========================================
     print()
     print("=" * 60)
-    print("Phase 4: Loading dataset")
+    print("Phase 3: Loading dataset")
     print("=" * 60)
     
-    # Check for prompts file
     prompts_file = data_path / "prompts.txt"
     prompts_file = str(prompts_file) if prompts_file.exists() else None
     
-    # Class images and conditioning directories (created by generate_class_images if prior preservation)
     class_images_dir = data_path / "class_images" if with_prior_preservation else None
-    # class_conditioning_dir is created alongside class_images by generate_class_images
     class_conditioning_dir = str(data_path / "class_conditioning") if with_prior_preservation else None
     
     dataset = DreamBoothControlNetDataset(
@@ -655,11 +561,11 @@ def train(
     print(f"   ✅ Dataloader created: {len(dataloader)} batches")
     
     # =========================================
-    # Optimizer
+    # Optimizer (for UNet only)
     # =========================================
     print()
     print("=" * 60)
-    print("Phase 5: Setting up optimizer")
+    print("Phase 4: Setting up optimizer (for UNet)")
     print("=" * 60)
     
     if use_8bit_adam:
@@ -674,14 +580,13 @@ def train(
         optimizer_class = torch.optim.AdamW
     
     optimizer = optimizer_class(
-        controlnet.parameters(),
+        unet.parameters(),  # Only UNet parameters!
         lr=learning_rate,
         betas=(0.9, 0.999),
         weight_decay=0.01,
         eps=1e-8,
     )
     
-    # LR scheduler
     lr_scheduler = get_scheduler(
         "constant",
         optimizer=optimizer,
@@ -695,16 +600,18 @@ def train(
     # =========================================
     print()
     print("=" * 60)
-    print("🚀 Phase 6: Starting Training")
+    print("🚀 Phase 5: Starting Training (UNet)")
     print("=" * 60)
+    print(f"  Training: UNet (identity learning)")
+    print(f"  Frozen: ControlNet, VAE, Text Encoder")
     print(f"  Prior preservation: {with_prior_preservation}")
-    print(f"  Prior loss weight: {prior_loss_weight}")
     print()
     
     global_step = 0
-    progress_bar = tqdm(range(max_train_steps), desc="Training")
+    progress_bar = tqdm(range(max_train_steps), desc="Training UNet")
     
-    controlnet.train()
+    unet.train()
+    controlnet.eval()  # ControlNet stays in eval mode
     
     while global_step < max_train_steps:
         for batch in dataloader:
@@ -732,29 +639,26 @@ def train(
             # Get text embeddings
             encoder_hidden_states = text_encoder(input_ids)[0]
             
-            # Get ControlNet output (ControlNet is in float32 for training stability)
-            down_block_res_samples, mid_block_res_sample = controlnet(
-                noisy_latents.float(),
+            # Get ControlNet output (frozen, no gradients)
+            with torch.no_grad():
+                down_block_res_samples, mid_block_res_sample = controlnet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                    controlnet_cond=conditioning_pixel_values,
+                    return_dict=False,
+                )
+            
+            # Predict noise with UNet (TRAINABLE) using ControlNet guidance
+            model_pred = unet(
+                noisy_latents.float(),  # UNet in float32 for training
                 timesteps,
                 encoder_hidden_states=encoder_hidden_states.float(),
-                controlnet_cond=conditioning_pixel_values.float(),
-                return_dict=False,
-            )
-            
-            # Cast ControlNet outputs back to weight_dtype for UNet
-            down_block_res_samples = [sample.to(dtype=weight_dtype) for sample in down_block_res_samples]
-            mid_block_res_sample = mid_block_res_sample.to(dtype=weight_dtype)
-            
-            # Predict noise with UNet using ControlNet guidance
-            model_pred = unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample,
+                down_block_additional_residuals=[s.float() for s in down_block_res_samples],
+                mid_block_additional_residual=mid_block_res_sample.float(),
             ).sample
             
-            # Get target (noise for epsilon prediction)
+            # Get target
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
             elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -764,17 +668,12 @@ def train(
             
             # Calculate loss with prior preservation
             if with_prior_preservation:
-                # Split predictions into instance and class
                 model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                 target, target_prior = torch.chunk(target, 2, dim=0)
                 
-                # Instance loss (identity-specific)
                 instance_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                
-                # Prior loss (preserve general knowledge)
                 prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
                 
-                # Combined loss
                 loss = instance_loss + prior_loss_weight * prior_loss
             else:
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -786,7 +685,7 @@ def train(
             
             # Update weights
             if (global_step + 1) % gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(controlnet.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -809,8 +708,11 @@ def train(
             # Save checkpoint
             if global_step % checkpointing_steps == 0:
                 checkpoint_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
-                controlnet.save_pretrained(checkpoint_dir)
-                print(f"\n💾 Checkpoint saved: {checkpoint_dir}")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                # Save only the UNet (what we trained)
+                unet_to_save = unet
+                unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
+                print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
             
             if global_step >= max_train_steps:
                 break
@@ -823,35 +725,54 @@ def train(
     print("💾 Saving Final Model")
     print("=" * 60)
     
-    controlnet.save_pretrained(output_dir)
-    print(f"✅ ControlNet saved to: {output_dir}")
+    # Save the full pipeline with trained UNet
+    from diffusers import StableDiffusionControlNetPipeline
+    
+    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+        pretrained_model,
+        unet=unet,
+        controlnet=controlnet,
+        text_encoder=text_encoder,
+        vae=vae,
+        tokenizer=tokenizer,
+        safety_checker=None,
+    )
+    pipeline.save_pretrained(output_dir)
+    print(f"✅ Full pipeline saved to: {output_dir}")
+    
+    # Also save just the UNet separately for easy loading
+    unet.save_pretrained(os.path.join(output_dir, "unet_trained"))
+    print(f"✅ Trained UNet also saved to: {output_dir}/unet_trained")
     
     print()
     print("=" * 60)
     print("✅ Training Complete!")
     print("=" * 60)
     print()
-    print("To use your trained DreamBooth ControlNet:")
+    print("To use your trained model:")
     print("```python")
     print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
-    print(f'controlnet = ControlNetModel.from_pretrained("{output_dir}")')
-    print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{pretrained_model}", controlnet=controlnet)')
-    print(f'image = pipe("{instance_prompt}", image=pose_image).images[0]')
+    print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{output_dir}")')
+    print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
     print("```")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DreamBooth + ControlNet Fine-tuning")
+    parser = argparse.ArgumentParser(
+        description="DreamBooth + ControlNet (UNet Training Mode) - trains UNet for identity learning"
+    )
     
     # Data and output
     parser.add_argument("--data_dir", type=str, default="./data", help="Data directory")
-    parser.add_argument("--output_dir", type=str, default="./output/controlnet-dreambooth")
+    parser.add_argument("--output_dir", type=str, default="./output/dreambooth-unet-controlnet")
     parser.add_argument("--pretrained_model", type=str, default="runwayml/stable-diffusion-v1-5")
+    parser.add_argument("--controlnet_model", type=str, default="lllyasviel/control_v11p_sd15_canny",
+                       help="Pretrained ControlNet to use (frozen)")
     
     # DreamBooth parameters
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person",
+    parser.add_argument("--instance_prompt", type=str, default="a photo of sks cat",
                        help="Prompt with rare identifier for the instance")
-    parser.add_argument("--class_prompt", type=str, default="a photo of person",
+    parser.add_argument("--class_prompt", type=str, default="a photo of cat",
                        help="General class prompt for prior preservation")
     parser.add_argument("--with_prior_preservation", action="store_true",
                        help="Enable prior preservation loss")
@@ -860,18 +781,18 @@ def main():
     parser.add_argument("--num_class_images", type=int, default=100,
                        help="Number of class images for prior preservation")
     parser.add_argument("--sample_batch_size", type=int, default=4,
-                       help="Batch size for class image generation (increase to use more GPU)")
+                       help="Batch size for class image generation")
     parser.add_argument("--conditioning_type", type=str, default="canny",
                        choices=["canny", "hed", "none"],
-                       help="Type of conditioning to extract for class images (canny, hed, or none for pre-made)")
+                       help="Type of conditioning to extract for class images")
     
     # Training parameters
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--learning_rate", type=float, default=1e-6,
-                       help="Learning rate (very low for fine-tuning pretrained ControlNet)")
-    parser.add_argument("--max_train_steps", type=int, default=400)
+    parser.add_argument("--learning_rate", type=float, default=5e-6,
+                       help="Learning rate (standard DreamBooth LR for UNet)")
+    parser.add_argument("--max_train_steps", type=int, default=800)
     parser.add_argument("--checkpointing_steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--repeats", type=int, default=20,
@@ -888,6 +809,7 @@ def main():
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         pretrained_model=args.pretrained_model,
+        controlnet_model=args.controlnet_model,
         instance_prompt=args.instance_prompt,
         class_prompt=args.class_prompt,
         with_prior_preservation=args.with_prior_preservation,

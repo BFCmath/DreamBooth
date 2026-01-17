@@ -4,7 +4,8 @@ the idea is to package file into .sh  or .py so that when clone the whole repo o
 
 # TOPIC
 Replicate DreamBooth using diffuser on stable-diffusion-v1-5 (done)
-inference script of control net that work on kaggle 
+inference script of control net that work on kaggle (done)
+fine-tune control net using dreambooth on kaggle (current)
 
 # META FILES
 - CONTEXT.md: this file
