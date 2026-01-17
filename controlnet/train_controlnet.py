@@ -355,14 +355,19 @@ def train(
             # Get text embeddings
             encoder_hidden_states = text_encoder(input_ids)[0]
             
-            # Get ControlNet output
+            # Get ControlNet output (ControlNet is in float32 for training stability)
+            # Cast inputs to float32 for ControlNet
             down_block_res_samples, mid_block_res_sample = controlnet(
-                noisy_latents,
+                noisy_latents.float(),
                 timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                controlnet_cond=conditioning_pixel_values,
+                encoder_hidden_states=encoder_hidden_states.float(),
+                controlnet_cond=conditioning_pixel_values.float(),
                 return_dict=False,
             )
+            
+            # Cast ControlNet outputs back to weight_dtype for UNet
+            down_block_res_samples = [sample.to(dtype=weight_dtype) for sample in down_block_res_samples]
+            mid_block_res_sample = mid_block_res_sample.to(dtype=weight_dtype)
             
             # Predict noise with UNet using ControlNet guidance
             model_pred = unet(
