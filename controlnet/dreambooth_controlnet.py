@@ -219,17 +219,18 @@ class DreamBoothControlNetDataset(Dataset):
             class_idx = idx % self.num_class_images
             class_path = self.class_images[class_idx]
             
-            # Use class conditioning if available, otherwise use instance conditioning directory
-            cond_dir = self.class_conditioning_dir if self.class_conditioning_dir else self.conditioning_dir
+            # MUST use class_conditioning_dir for proper (image, conditioning) pairs
+            if self.class_conditioning_dir is None:
+                raise ValueError(
+                    "Prior preservation requires class_conditioning_dir! "
+                    "Run training with --with_prior_preservation to auto-generate class images + conditioning."
+                )
             
-            try:
-                class_pixels, class_cond = self._load_image_and_conditioning(class_path, cond_dir)
-                example["class_pixel_values"] = class_pixels
-                example["class_conditioning"] = class_cond
-            except FileNotFoundError:
-                # Fallback: use instance conditioning resized/reused
-                example["class_pixel_values"] = pixel_values.clone()
-                example["class_conditioning"] = conditioning_pixel_values.clone()
+            class_pixels, class_cond = self._load_image_and_conditioning(
+                class_path, self.class_conditioning_dir
+            )
+            example["class_pixel_values"] = class_pixels
+            example["class_conditioning"] = class_cond
             
             example["class_prompt_ids"] = self.tokenizer(
                 self.class_prompt,
@@ -283,6 +284,7 @@ def print_vram(label=""):
 # =============================================================================
 def generate_class_images(
     class_images_dir: str,
+    class_conditioning_dir: str,  # NEW: also save conditioning
     class_prompt: str,
     num_class_images: int,
     pretrained_model: str,
@@ -291,25 +293,39 @@ def generate_class_images(
     sample_batch_size: int = 4,  # Generate 4 images at a time for speed
 ):
     """
-    Generate class images for prior preservation.
-    Uses the base SD model (optionally with ControlNet) to generate diverse class images.
+    Generate class images AND their conditioning (Canny edges) for prior preservation.
+    
+    This ensures proper (image, conditioning) pairs for the prior loss calculation.
+    Without matching conditioning, the prior loss would use mismatched pairs.
     
     Args:
-        sample_batch_size: Number of images to generate per batch (increase to use more GPU)
+        class_images_dir: Directory to save generated class images
+        class_conditioning_dir: Directory to save Canny edges for class images
+        sample_batch_size: Number of images to generate per batch
     """
+    import cv2
+    import numpy as np
+    
     class_dir = Path(class_images_dir)
     class_dir.mkdir(parents=True, exist_ok=True)
+    
+    cond_dir = Path(class_conditioning_dir)
+    cond_dir.mkdir(parents=True, exist_ok=True)
     
     # Count existing images
     existing_images = list(class_dir.glob("*.png")) + list(class_dir.glob("*.jpg"))
     cur_class_images = len(existing_images)
     
     if cur_class_images >= num_class_images:
-        print(f"✅ Found {cur_class_images} existing class images (needed {num_class_images})")
-        return
+        # Also check if conditioning exists
+        existing_cond = list(cond_dir.glob("*.png")) + list(cond_dir.glob("*.jpg"))
+        if len(existing_cond) >= num_class_images:
+            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning (needed {num_class_images})")
+            return
     
     num_to_generate = num_class_images - cur_class_images
     print(f"📸 Generating {num_to_generate} class images with prompt: '{class_prompt}'")
+    print(f"   Also extracting Canny edges for each class image")
     print(f"   Batch size: {sample_batch_size} (adjust SAMPLE_BATCH_SIZE to use more GPU)")
     
     from diffusers import StableDiffusionPipeline
@@ -326,7 +342,7 @@ def generate_class_images(
     num_batches = (num_to_generate + sample_batch_size - 1) // sample_batch_size
     generated = 0
     
-    for batch_idx in tqdm(range(num_batches), desc="Generating class images"):
+    for batch_idx in tqdm(range(num_batches), desc="Generating class images + conditioning"):
         # Calculate how many images to generate in this batch
         remaining = num_to_generate - generated
         batch_count = min(sample_batch_size, remaining)
@@ -338,10 +354,22 @@ def generate_class_images(
             guidance_scale=7.5,
         ).images
         
-        # Save each image
+        # Save each image AND extract Canny edges
         for i, image in enumerate(images):
-            image_path = class_dir / f"class_{cur_class_images + generated + i:04d}.png"
+            idx = cur_class_images + generated + i
+            
+            # Save class image
+            image_path = class_dir / f"class_{idx:04d}.png"
             image.save(image_path)
+            
+            # Extract and save Canny edges (conditioning)
+            image_np = np.array(image)
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 100, 200)
+            edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+            
+            cond_path = cond_dir / f"class_{idx:04d}.png"
+            Image.fromarray(edges_rgb).save(cond_path)
         
         generated += batch_count
     
@@ -349,7 +377,7 @@ def generate_class_images(
     torch.cuda.empty_cache()
     gc.collect()
     
-    print(f"✅ Generated {num_to_generate} class images")
+    print(f"✅ Generated {num_to_generate} class images + conditioning")
 
 
 # =============================================================================
@@ -461,8 +489,10 @@ def train(
         print("=" * 60)
         
         class_images_dir = data_path / "class_images"
+        class_conditioning_dir = data_path / "class_conditioning"
         generate_class_images(
             class_images_dir=str(class_images_dir),
+            class_conditioning_dir=str(class_conditioning_dir),
             class_prompt=class_prompt,
             num_class_images=num_class_images,
             pretrained_model=pretrained_model,
@@ -542,10 +572,10 @@ def train(
     prompts_file = data_path / "prompts.txt"
     prompts_file = str(prompts_file) if prompts_file.exists() else None
     
-    # Class images and conditioning directories
+    # Class images and conditioning directories (created by generate_class_images if prior preservation)
     class_images_dir = data_path / "class_images" if with_prior_preservation else None
-    class_conditioning_dir = data_path / "class_conditioning"
-    class_conditioning_dir = str(class_conditioning_dir) if class_conditioning_dir.exists() else None
+    # class_conditioning_dir is created alongside class_images by generate_class_images
+    class_conditioning_dir = str(data_path / "class_conditioning") if with_prior_preservation else None
     
     dataset = DreamBoothControlNetDataset(
         instance_images_dir=str(data_path / "instance_images"),
