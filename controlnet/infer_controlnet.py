@@ -59,6 +59,7 @@ def generate_images(
     seed: int = None,
     negative_prompt: str = "lowres, bad anatomy, worst quality, low quality, deformed, ugly",
     low_vram_mode: bool = False,
+    unet_lora_path: str = None,  # Path to LoRA weights for UNet
 ):
     """
     Generate images using ControlNet with various conditioning types.
@@ -215,6 +216,17 @@ def generate_images(
     
     # Use faster scheduler
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    
+    # Load LoRA weights if provided
+    if unet_lora_path:
+        print(f"⏳ Loading LoRA weights: {unet_lora_path}")
+        try:
+            from peft import PeftModel
+            pipe.unet = PeftModel.from_pretrained(pipe.unet, unet_lora_path)
+            print("✅ LoRA weights loaded!")
+        except Exception as e:
+            print(f"❌ Failed to load LoRA weights: {e}")
+            raise
     
     # =========================================
     # VRAM Debug Helper
@@ -476,6 +488,12 @@ def main():
         action="store_true",
         help="Enable low VRAM mode for P100 (16GB) - uses CPU offloading",
     )
+    parser.add_argument(
+        "--unet_lora_path",
+        type=str,
+        default=None,
+        help="Path to LoRA weights for UNet (from DreamBooth LoRA training)",
+    )
     
     args = parser.parse_args()
     print("START")
@@ -495,6 +513,7 @@ def main():
         seed=args.seed,
         negative_prompt=args.negative_prompt,
         low_vram_mode=args.low_vram,
+        unet_lora_path=args.unet_lora_path,
     )
 
 
