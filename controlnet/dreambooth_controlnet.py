@@ -62,6 +62,9 @@ from diffusers import (
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 
+# Local utilities
+from utils import print_vram, extract_conditioning, collate_fn
+
 
 # =============================================================================
 # Dataset for DreamBooth + ControlNet
@@ -241,85 +244,6 @@ class DreamBoothControlNetDataset(Dataset):
             ).input_ids.squeeze(0)
         
         return example
-
-
-def collate_fn(examples, with_prior_preservation=False):
-    """Collate function for DataLoader."""
-    instance_pixel_values = [ex["instance_pixel_values"] for ex in examples]
-    instance_conditioning = [ex["instance_conditioning"] for ex in examples]
-    instance_prompt_ids = [ex["instance_prompt_ids"] for ex in examples]
-    
-    if with_prior_preservation:
-        class_pixel_values = [ex["class_pixel_values"] for ex in examples]
-        class_conditioning = [ex["class_conditioning"] for ex in examples]
-        class_prompt_ids = [ex["class_prompt_ids"] for ex in examples]
-        
-        pixel_values = torch.stack(instance_pixel_values + class_pixel_values)
-        conditioning = torch.stack(instance_conditioning + class_conditioning)
-        input_ids = torch.stack(instance_prompt_ids + class_prompt_ids)
-    else:
-        pixel_values = torch.stack(instance_pixel_values)
-        conditioning = torch.stack(instance_conditioning)
-        input_ids = torch.stack(instance_prompt_ids)
-    
-    return {
-        "pixel_values": pixel_values,
-        "conditioning_pixel_values": conditioning,
-        "input_ids": input_ids,
-    }
-
-
-# =============================================================================
-# VRAM Debug Helper
-# =============================================================================
-def print_vram(label=""):
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"   📊 VRAM [{label}]: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
-
-
-# =============================================================================
-# Conditioning Extraction Utilities
-# =============================================================================
-def extract_conditioning(image_np, conditioning_type: str):
-    """
-    Extract conditioning from an image based on the specified type.
-    
-    Args:
-        image_np: RGB numpy array (H, W, 3)
-        conditioning_type: Type of conditioning to extract
-            - "canny": Canny edge detection
-            - "hed": HED-style soft edges (approximated with dilated Canny)
-            - "none": Return None (user provides conditioning separately)
-    
-    Returns:
-        RGB numpy array of conditioning image, or None if type is "none"
-    """
-    import cv2
-    import numpy as np
-    
-    if conditioning_type == "canny":
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 100, 200)
-        return cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-    
-    elif conditioning_type == "hed":
-        # HED-style soft edges (approximated with dilated Canny)
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        return cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-    
-    elif conditioning_type == "none":
-        return None
-    
-    else:
-        raise ValueError(
-            f"Unknown conditioning_type: {conditioning_type}. "
-            f"Supported types: canny, hed, none"
-        )
 
 
 # =============================================================================
@@ -878,9 +802,6 @@ def main():
                        help="Number of class images for prior preservation")
     parser.add_argument("--sample_batch_size", type=int, default=4,
                        help="Batch size for class image generation (increase to use more GPU)")
-    parser.add_argument("--conditioning_type", type=str, default="canny",
-                       choices=["canny", "hed", "none"],
-                       help="Type of conditioning to extract for class images (canny, hed, or none for pre-made)")
     
     # Training parameters
     parser.add_argument("--resolution", type=int, default=512)
@@ -911,7 +832,6 @@ def main():
         prior_loss_weight=args.prior_loss_weight,
         num_class_images=args.num_class_images,
         sample_batch_size=args.sample_batch_size,
-        conditioning_type=args.conditioning_type,
         resolution=args.resolution,
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
