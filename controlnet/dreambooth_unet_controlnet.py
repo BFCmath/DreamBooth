@@ -59,6 +59,9 @@ from diffusers import (
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 
+# Local utilities
+from utils import print_vram, extract_conditioning, collate_fn
+
 
 # =============================================================================
 # Dataset for DreamBooth + ControlNet
@@ -229,93 +232,40 @@ class DreamBoothControlNetDataset(Dataset):
         return example
 
 
-def collate_fn(examples, with_prior_preservation=False):
-    """Collate function for DataLoader."""
-    instance_pixel_values = [ex["instance_pixel_values"] for ex in examples]
-    instance_conditioning = [ex["instance_conditioning"] for ex in examples]
-    instance_prompt_ids = [ex["instance_prompt_ids"] for ex in examples]
-    
-    if with_prior_preservation:
-        class_pixel_values = [ex["class_pixel_values"] for ex in examples]
-        class_conditioning = [ex["class_conditioning"] for ex in examples]
-        class_prompt_ids = [ex["class_prompt_ids"] for ex in examples]
-        
-        pixel_values = torch.stack(instance_pixel_values + class_pixel_values)
-        conditioning = torch.stack(instance_conditioning + class_conditioning)
-        input_ids = torch.stack(instance_prompt_ids + class_prompt_ids)
-    else:
-        pixel_values = torch.stack(instance_pixel_values)
-        conditioning = torch.stack(instance_conditioning)
-        input_ids = torch.stack(instance_prompt_ids)
-    
-    return {
-        "pixel_values": pixel_values,
-        "conditioning_pixel_values": conditioning,
-        "input_ids": input_ids,
-    }
-
-
-# =============================================================================
-# VRAM Debug Helper
-# =============================================================================
-def print_vram(label=""):
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"   📊 VRAM [{label}]: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
-
-
-# =============================================================================
-# Conditioning Extraction Utilities
-# =============================================================================
-def extract_conditioning(image_np, conditioning_type: str):
-    """
-    Extract conditioning from an image based on the specified type.
-    """
-    import cv2
-    import numpy as np
-    
-    if conditioning_type == "canny":
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 100, 200)
-        return cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-    
-    elif conditioning_type == "hed":
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        return cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-    
-    elif conditioning_type == "none":
-        return None
-    
-    else:
-        raise ValueError(f"Unknown conditioning_type: {conditioning_type}")
-
-
 # =============================================================================
 # Class Image Generation (for Prior Preservation)
 # =============================================================================
 def generate_class_images(
     class_images_dir: str,
     class_conditioning_dir: str,
+    instance_conditioning_dir: str,  # NEW: Use instance conditioning for class generation
     class_prompt: str,
     num_class_images: int,
     pretrained_model: str,
-    conditioning_type: str = "canny",
+    controlnet_path: str,  # REQUIRED: Need ControlNet for conditioned generation
     device: str = "cuda",
-    sample_batch_size: int = 4,
+    sample_batch_size: int = 1,  # Lower default for ControlNet pipeline
 ):
-    """Generate class images AND their conditioning for prior preservation."""
-    import cv2
-    import numpy as np
+    """
+    Generate class images using the SAME conditioning as instance images.
+    
+    This is crucial for proper DreamBooth + ControlNet training:
+    - Instance: (instance_image, pose_i, "sks cat") 
+    - Class:   (class_image, pose_i, "cat")  <- SAME pose!
+    
+    The prior preservation loss then teaches:
+    - "sks" modifier means this specific identity
+    - Pose control is preserved because both use the same conditioning
+    """
+    import shutil
     
     class_dir = Path(class_images_dir)
     class_dir.mkdir(parents=True, exist_ok=True)
     
     cond_dir = Path(class_conditioning_dir)
     cond_dir.mkdir(parents=True, exist_ok=True)
+    
+    instance_cond_dir = Path(instance_conditioning_dir)
     
     # Count existing images
     existing_images = list(class_dir.glob("*.png")) + list(class_dir.glob("*.jpg"))
@@ -324,56 +274,71 @@ def generate_class_images(
     if cur_class_images >= num_class_images:
         existing_cond = list(cond_dir.glob("*.png")) + list(cond_dir.glob("*.jpg"))
         if len(existing_cond) >= num_class_images:
-            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning")
+            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning (needed {num_class_images})")
             return
+    
+    # Load instance conditioning images
+    instance_cond_files = sorted([
+        f for f in instance_cond_dir.iterdir()
+        if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']
+    ])
+    
+    if len(instance_cond_files) == 0:
+        raise ValueError(f"No conditioning images found in {instance_conditioning_dir}")
     
     num_to_generate = num_class_images - cur_class_images
     print(f"📸 Generating {num_to_generate} class images with prompt: '{class_prompt}'")
-    if conditioning_type != "none":
-        print(f"   Also extracting {conditioning_type} conditioning for each class image")
+    print(f"   🎯 Using instance conditioning for proper prior preservation!")
+    print(f"   📂 Instance conditioning dir: {instance_conditioning_dir}")
+    print(f"   📂 ControlNet: {controlnet_path}")
     
-    from diffusers import StableDiffusionPipeline
+    # Load ControlNet pipeline for conditioned generation
+    controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch.float16)
     
-    pipeline = StableDiffusionPipeline.from_pretrained(
+    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         pretrained_model,
+        controlnet=controlnet,
         torch_dtype=torch.float16,
         safety_checker=None,
     )
     pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     
-    num_batches = (num_to_generate + sample_batch_size - 1) // sample_batch_size
     generated = 0
     
-    for batch_idx in tqdm(range(num_batches), desc="Generating class images"):
-        remaining = num_to_generate - generated
-        batch_count = min(sample_batch_size, remaining)
+    for idx in tqdm(range(num_to_generate), desc="Generating class images with instance conditioning"):
+        # Cycle through instance conditioning images
+        cond_idx = (cur_class_images + idx) % len(instance_cond_files)
+        cond_file = instance_cond_files[cond_idx]
         
-        images = pipeline(
-            [class_prompt] * batch_count,
+        # Load conditioning image
+        cond_image = Image.open(cond_file).convert("RGB")
+        
+        # Generate class image using the SAME conditioning as instance
+        image = pipeline(
+            prompt=class_prompt,
+            image=cond_image,
             num_inference_steps=25,
             guidance_scale=7.5,
-        ).images
+        ).images[0]
         
-        for i, image in enumerate(images):
-            idx = cur_class_images + generated + i
-            
-            image_path = class_dir / f"class_{idx:04d}.png"
-            image.save(image_path)
-            
-            if conditioning_type != "none":
-                image_np = np.array(image)
-                cond_rgb = extract_conditioning(image_np, conditioning_type)
-                cond_path = cond_dir / f"class_{idx:04d}.png"
-                Image.fromarray(cond_rgb).save(cond_path)
+        # Save class image
+        class_image_idx = cur_class_images + idx
+        image_path = class_dir / f"class_{class_image_idx:04d}.png"
+        image.save(image_path)
         
-        generated += batch_count
+        # Copy/save the conditioning (same as instance conditioning)
+        cond_path = cond_dir / f"class_{class_image_idx:04d}.png"
+        cond_image.save(cond_path)  # Save the conditioning we used
+        
+        generated += 1
     
     del pipeline
+    del controlnet
     torch.cuda.empty_cache()
     gc.collect()
     
-    print(f"✅ Generated {num_to_generate} class images + conditioning")
+    print(f"✅ Generated {num_to_generate} class images using instance conditioning")
 
 
 # =============================================================================
@@ -391,7 +356,6 @@ def train(
     prior_loss_weight: float = 1.0,
     num_class_images: int = 100,
     sample_batch_size: int = 4,
-    conditioning_type: str = "canny",
     # Training parameters
     resolution: int = 512,
     train_batch_size: int = 1,
@@ -431,7 +395,6 @@ def train(
     print(f"  Prior preservation: {with_prior_preservation}")
     print(f"  Prior loss weight: {prior_loss_weight}")
     print(f"  Num class images: {num_class_images}")
-    print(f"  Conditioning type: {conditioning_type}")
     print()
     print("Training Configuration:")
     print(f"  Resolution: {resolution}")
@@ -465,13 +428,16 @@ def train(
         
         class_images_dir = data_path / "class_images"
         class_conditioning_dir = data_path / "class_conditioning"
+        instance_conditioning_dir = data_path / "conditioning"
+        
         generate_class_images(
             class_images_dir=str(class_images_dir),
             class_conditioning_dir=str(class_conditioning_dir),
+            instance_conditioning_dir=str(instance_conditioning_dir),
             class_prompt=class_prompt,
             num_class_images=num_class_images,
             pretrained_model=pretrained_model,
-            conditioning_type=conditioning_type,
+            controlnet_path=controlnet_model,
             device=device,
             sample_batch_size=sample_batch_size,
         )
@@ -782,9 +748,6 @@ def main():
                        help="Number of class images for prior preservation")
     parser.add_argument("--sample_batch_size", type=int, default=4,
                        help="Batch size for class image generation")
-    parser.add_argument("--conditioning_type", type=str, default="canny",
-                       choices=["canny", "hed", "none"],
-                       help="Type of conditioning to extract for class images")
     
     # Training parameters
     parser.add_argument("--resolution", type=int, default=512)
@@ -816,7 +779,6 @@ def main():
         prior_loss_weight=args.prior_loss_weight,
         num_class_images=args.num_class_images,
         sample_batch_size=args.sample_batch_size,
-        conditioning_type=args.conditioning_type,
         resolution=args.resolution,
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
