@@ -58,6 +58,8 @@ from diffusers import (
 )
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 
 # Local utilities
 from utils import print_vram, extract_conditioning, collate_fn
@@ -406,41 +408,54 @@ def train(
     print("=" * 60)
     print()
     
-    # Setup
-    os.makedirs(output_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    weight_dtype = torch.float16 if mixed_precision and device == "cuda" else torch.float32
+    # Setup Accelerator for multi-GPU training
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision="fp16" if mixed_precision else "no",
+    )
+    
+    # Only create output dir on main process
+    if accelerator.is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    device = accelerator.device
+    weight_dtype = torch.float16 if mixed_precision else torch.float32
     
     if seed is not None:
-        torch.manual_seed(seed)
+        set_seed(seed)
     
     data_path = Path(data_dir)
     
-    print_vram("Initial")
+    if accelerator.is_main_process:
+        print_vram("Initial")
     
     # =========================================
     # Generate Class Images (if needed)
     # =========================================
     if with_prior_preservation:
-        print("=" * 60)
-        print("Phase 1: Generating class images for prior preservation")
-        print("=" * 60)
-        
-        class_images_dir = data_path / "class_images"
-        class_conditioning_dir = data_path / "class_conditioning"
-        instance_conditioning_dir = data_path / "conditioning"
-        
-        generate_class_images(
-            class_images_dir=str(class_images_dir),
-            class_conditioning_dir=str(class_conditioning_dir),
-            instance_conditioning_dir=str(instance_conditioning_dir),
-            class_prompt=class_prompt,
-            num_class_images=num_class_images,
-            pretrained_model=pretrained_model,
-            controlnet_path=controlnet_model,
-            device=device,
-            sample_batch_size=sample_batch_size,
-        )
+        # Only generate class images on main process
+        if accelerator.is_main_process:
+            print("=" * 60)
+            print("Phase 1: Generating class images for prior preservation")
+            print("=" * 60)
+            
+            class_images_dir = data_path / "class_images"
+            class_conditioning_dir = data_path / "class_conditioning"
+            instance_conditioning_dir = data_path / "conditioning"
+            
+            generate_class_images(
+                class_images_dir=str(class_images_dir),
+                class_conditioning_dir=str(class_conditioning_dir),
+                instance_conditioning_dir=str(instance_conditioning_dir),
+                class_prompt=class_prompt,
+                num_class_images=num_class_images,
+                pretrained_model=pretrained_model,
+                controlnet_path=controlnet_model,
+                device="cuda",  # Use cuda directly for class generation
+                sample_batch_size=sample_batch_size,
+            )
+        # Wait for class images to be generated before all processes continue
+        accelerator.wait_for_everyone()
         print()
     
     # =========================================
@@ -486,6 +501,14 @@ def train(
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         print("   ✅ UNet gradient checkpointing enabled")
+    
+    # Enable xformers memory efficient attention if available
+    try:
+        unet.enable_xformers_memory_efficient_attention()
+        controlnet.enable_xformers_memory_efficient_attention()
+        print("   ✅ Enabled xformers memory efficient attention (UNet + ControlNet)")
+    except Exception as e:
+        print(f"   ⚠️  Could not enable xformers: {e}")
     
     # =========================================
     # Dataset
@@ -561,6 +584,18 @@ def train(
     )
     print("   ✅ Optimizer and LR scheduler ready")
     
+    # Prepare for distributed training
+    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, dataloader, lr_scheduler
+    )
+    
+    # Move frozen models to device
+    vae.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    controlnet.to(accelerator.device, dtype=weight_dtype)
+    
+    print(f"   ✅ Models prepared for distributed training on {accelerator.num_processes} GPU(s)")
+    
     # =========================================
     # Training Loop
     # =========================================
@@ -581,104 +616,104 @@ def train(
     
     while global_step < max_train_steps:
         for batch in dataloader:
-            # Move to device
-            pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
-            conditioning_pixel_values = batch["conditioning_pixel_values"].to(device, dtype=weight_dtype)
-            input_ids = batch["input_ids"].to(device)
-            
-            # Encode images to latent space
-            latents = vae.encode(pixel_values).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
-            
-            # Sample noise
-            noise = torch.randn_like(latents)
-            bsz = latents.shape[0]
-            
-            # Sample timesteps
-            timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device
-            ).long()
-            
-            # Add noise to latents
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            
-            # Get text embeddings
-            encoder_hidden_states = text_encoder(input_ids)[0]
-            
-            # Get ControlNet output (frozen, no gradients)
-            with torch.no_grad():
-                down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents,
+            with accelerator.accumulate(unet):
+                # Data is already on device from accelerator
+                pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+                conditioning_pixel_values = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                input_ids = batch["input_ids"]
+                
+                # Encode images to latent space
+                latents = vae.encode(pixel_values).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+                
+                # Sample noise
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+                
+                # Sample timesteps
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=accelerator.device
+                ).long()
+                
+                # Add noise to latents
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                
+                # Get text embeddings
+                encoder_hidden_states = text_encoder(input_ids)[0]
+                
+                # Get ControlNet output (frozen, no gradients)
+                with torch.no_grad():
+                    down_block_res_samples, mid_block_res_sample = controlnet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                        controlnet_cond=conditioning_pixel_values,
+                        return_dict=False,
+                    )
+                
+                # Predict noise with UNet (TRAINABLE) using ControlNet guidance
+                model_pred = unet(
+                    noisy_latents.float(),  # UNet in float32 for training
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    controlnet_cond=conditioning_pixel_values,
-                    return_dict=False,
-                )
-            
-            # Predict noise with UNet (TRAINABLE) using ControlNet guidance
-            model_pred = unet(
-                noisy_latents.float(),  # UNet in float32 for training
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states.float(),
-                down_block_additional_residuals=[s.float() for s in down_block_res_samples],
-                mid_block_additional_residual=mid_block_res_sample.float(),
-            ).sample
-            
-            # Get target
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-            
-            # Calculate loss with prior preservation
-            if with_prior_preservation:
-                model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                target, target_prior = torch.chunk(target, 2, dim=0)
+                    encoder_hidden_states=encoder_hidden_states.float(),
+                    down_block_additional_residuals=[s.float() for s in down_block_res_samples],
+                    mid_block_additional_residual=mid_block_res_sample.float(),
+                ).sample
                 
-                instance_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                # Get target
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 
-                loss = instance_loss + prior_loss_weight * prior_loss
-            else:
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-            
-            loss = loss / gradient_accumulation_steps
-            
-            # Backward
-            loss.backward()
-            
-            # Update weights
-            if (global_step + 1) % gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-            
-            # Logging
-            progress_bar.update(1)
-            effective_loss = loss.item() * gradient_accumulation_steps
-            progress_bar.set_postfix(loss=effective_loss)
-            
-            global_step += 1
-            
-            # Periodic logging
-            if global_step % 50 == 0:
-                log_msg = f"\n📊 Step {global_step}/{max_train_steps} | Loss: {effective_loss:.4f}"
+                # Calculate loss with prior preservation
                 if with_prior_preservation:
-                    log_msg += f" (instance: {instance_loss.item():.4f}, prior: {prior_loss.item():.4f})"
-                print(log_msg)
-                print_vram("Training")
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
+                    
+                    instance_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    
+                    loss = instance_loss + prior_loss_weight * prior_loss
+                else:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                
+                # Backward with accelerator
+                accelerator.backward(loss)
+                
+                # Update weights (accelerator handles gradient sync)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
             
-            # Save checkpoint
-            if global_step % checkpointing_steps == 0:
-                checkpoint_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
-                os.makedirs(checkpoint_dir, exist_ok=True)
-                # Save only the UNet (what we trained)
-                unet_to_save = unet
-                unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
-                print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
+            # Logging (only update progress on sync)
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                
+                effective_loss = loss.item()
+                progress_bar.set_postfix(loss=effective_loss)
+                
+                # Periodic logging
+                if global_step % 50 == 0 and accelerator.is_main_process:
+                    log_msg = f"\n📊 Step {global_step}/{max_train_steps} | Loss: {effective_loss:.4f}"
+                    if with_prior_preservation:
+                        log_msg += f" (instance: {instance_loss.item():.4f}, prior: {prior_loss.item():.4f})"
+                    print(log_msg)
+                    print_vram("Training")
+                
+                # Save checkpoint (only on main process)
+                if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
+                    checkpoint_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    # Unwrap and save the UNet
+                    unet_to_save = accelerator.unwrap_model(unet)
+                    unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
+                    print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
             
             if global_step >= max_train_steps:
                 break
@@ -686,41 +721,49 @@ def train(
     # =========================================
     # Save Final Model
     # =========================================
-    print()
-    print("=" * 60)
-    print("💾 Saving Final Model")
-    print("=" * 60)
+    accelerator.wait_for_everyone()
     
-    # Save the full pipeline with trained UNet
-    from diffusers import StableDiffusionControlNetPipeline
+    if accelerator.is_main_process:
+        print()
+        print("=" * 60)
+        print("💾 Saving Final Model")
+        print("=" * 60)
+        
+        # Unwrap the trained UNet
+        unwrapped_unet = accelerator.unwrap_model(unet)
+        
+        # Save the full pipeline with trained UNet
+        from diffusers import StableDiffusionControlNetPipeline
+        
+        pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+            pretrained_model,
+            unet=unwrapped_unet,
+            controlnet=controlnet,
+            text_encoder=text_encoder,
+            vae=vae,
+            tokenizer=tokenizer,
+            safety_checker=None,
+        )
+        pipeline.save_pretrained(output_dir)
+        print(f"✅ Full pipeline saved to: {output_dir}")
+        
+        # Also save just the UNet separately for easy loading
+        unwrapped_unet.save_pretrained(os.path.join(output_dir, "unet_trained"))
+        print(f"✅ Trained UNet also saved to: {output_dir}/unet_trained")
+        
+        print()
+        print("=" * 60)
+        print("✅ Training Complete!")
+        print("=" * 60)
+        print()
+        print("To use your trained model:")
+        print("```python")
+        print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
+        print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{output_dir}")')
+        print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
+        print("```")
     
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-        pretrained_model,
-        unet=unet,
-        controlnet=controlnet,
-        text_encoder=text_encoder,
-        vae=vae,
-        tokenizer=tokenizer,
-        safety_checker=None,
-    )
-    pipeline.save_pretrained(output_dir)
-    print(f"✅ Full pipeline saved to: {output_dir}")
-    
-    # Also save just the UNet separately for easy loading
-    unet.save_pretrained(os.path.join(output_dir, "unet_trained"))
-    print(f"✅ Trained UNet also saved to: {output_dir}/unet_trained")
-    
-    print()
-    print("=" * 60)
-    print("✅ Training Complete!")
-    print("=" * 60)
-    print()
-    print("To use your trained model:")
-    print("```python")
-    print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
-    print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{output_dir}")')
-    print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
-    print("```")
+    accelerator.end_training()
 
 
 def main():
