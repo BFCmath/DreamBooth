@@ -691,11 +691,12 @@ def train(
                 encoder_hidden_states = text_encoder(input_ids)[0]
                 
                 # Get ControlNet output (frozen, no gradients)
+                # Cast to weight_dtype since ControlNet is in fp16
                 with torch.no_grad():
                     down_block_res_samples, mid_block_res_sample = controlnet(
                         noisy_latents,
                         timesteps,
-                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_hidden_states=encoder_hidden_states.to(dtype=weight_dtype),
                         controlnet_cond=conditioning_pixel_values,
                         return_dict=False,
                     )
