@@ -299,7 +299,7 @@ def generate_images(
             image = pipe(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                image=pose_image,
+                image=conditioning_image,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 controlnet_conditioning_scale=controlnet_conditioning_scale,
@@ -352,13 +352,17 @@ def generate_images(
             f.write(f"<p>Prompt: <em>{prompt}</em></p>")
             f.write("<div class='container'>")
             
-            # Add pose image
+            # Add conditioning image
             f.write("<div class='image-card'>")
-            f.write("<h3>Input Pose</h3>")
-            if not use_pose_image_directly:
-                f.write("<img src='extracted_pose.png' alt='Extracted Pose'>")
+            f.write("<h3>Conditioning</h3>")
+            if detected_type == "canny":
+                f.write("<img src='extracted_canny.png' alt='Canny Edges'>")
+            elif detected_type == "hed":
+                f.write("<img src='extracted_hed.png' alt='HED Edges'>")
+            elif detected_type == "openpose":
+                f.write("<img src='extracted_pose.png' alt='OpenPose'>")
             else:
-                f.write(f"<img src='{os.path.basename(input_image)}' alt='Input Pose'>")
+                f.write(f"<img src='{os.path.basename(input_image)}' alt='Input'>")
             f.write("</div>")
             
             for prompt_text, _, filepath in all_images:
