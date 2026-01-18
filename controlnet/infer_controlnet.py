@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-ControlNet Inference Script with OpenPose Conditioning
-Run on Kaggle P100 to generate pose-controlled images using Stable Diffusion 1.5
+ControlNet Inference Script with Multiple Conditioning Types
+Run on Kaggle P100 to generate conditioned images using Stable Diffusion 1.5
 
 Supports:
-- Automatic pose extraction from input image via controlnet-aux
-- Pre-made pose/skeleton images as direct input
-- Custom or DreamBooth-finetuned SD 1.5 models
+- Canny edge detection (for lllyasviel/control_v11p_sd15_canny)
+- HED edge detection (for lllyasviel/control_v11p_sd15_hed)
+- OpenPose skeleton detection (for lllyasviel/control_v11p_sd15_openpose)
+- Pre-made conditioning images as direct input
 """
 
 import argparse
@@ -20,13 +21,26 @@ from diffusers.utils import load_image
 import gc
 
 
-def extract_pose(image_path: str, detector):
+def extract_canny(image, low_threshold: int = 100, high_threshold: int = 200):
+    """Extract Canny edges from an image."""
+    import cv2
+    import numpy as np
+    
+    image_np = np.array(image)
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, low_threshold, high_threshold)
+    edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+    return Image.fromarray(edges_rgb)
+
+
+def extract_hed(image, detector):
+    """Extract HED soft edges from an image."""
+    return detector(image)
+
+
+def extract_pose(image, detector):
     """Extract OpenPose skeleton from an image."""
-    print(f"  ⏳ Extracting pose from: {image_path}")
-    image = load_image(image_path)
-    pose_image = detector(image)
-    print("  ✅ Pose extracted successfully!")
-    return pose_image
+    return detector(image)
 
 
 def generate_images(
@@ -34,7 +48,8 @@ def generate_images(
     input_image: str,
     output_dir: str = "./output_images",
     model_path: str = "runwayml/stable-diffusion-v1-5",
-    controlnet_model: str = "lllyasviel/control_v11p_sd15_openpose",
+    controlnet_model: str = "lllyasviel/control_v11p_sd15_canny",
+    detector_type: str = "auto",  # auto, canny, hed, openpose, none
     num_images: int = 1,
     num_inference_steps: int = 30,
     guidance_scale: float = 7.5,
@@ -42,19 +57,19 @@ def generate_images(
     height: int = 512,
     width: int = 512,
     seed: int = None,
-    use_pose_image_directly: bool = False,
     negative_prompt: str = "lowres, bad anatomy, worst quality, low quality, deformed, ugly",
     low_vram_mode: bool = False,
 ):
     """
-    Generate images using ControlNet with OpenPose conditioning.
+    Generate images using ControlNet with various conditioning types.
     
     Args:
         prompt: Text prompt for image generation
-        input_image: Path to input image (for pose extraction) or pose image
+        input_image: Path to input image (for conditioning extraction) or conditioning image
         output_dir: Directory to save generated images
         model_path: Path to SD 1.5 model (can be DreamBooth-finetuned)
-        controlnet_model: ControlNet model for pose conditioning
+        controlnet_model: ControlNet model (canny, hed, openpose, etc.)
+        detector_type: "auto" (detect from model), "canny", "hed", "openpose", or "none" (use input directly)
         num_images: Number of images to generate
         num_inference_steps: Denoising steps (higher = better quality)
         guidance_scale: How closely to follow the prompt
@@ -62,7 +77,6 @@ def generate_images(
         height: Output image height
         width: Output image width
         seed: Random seed for reproducibility
-        use_pose_image_directly: If True, skip pose extraction
         negative_prompt: What to avoid in generation
         low_vram_mode: Enable aggressive memory optimizations for P100 (16GB)
     """
@@ -100,41 +114,84 @@ def generate_images(
     print()
     
     # =========================================
-    # STEP 1: Extract pose FIRST (if needed)
-    # This runs the OpenPose detector separately to free GPU memory before loading SD
+    # STEP 1: Extract conditioning FIRST (if needed)
+    # This runs the detector separately to free GPU memory before loading SD
     # =========================================
-    if use_pose_image_directly:
-        print("📷 Using input as pose image directly")
-        pose_image = load_image(input_image)
+    
+    # Auto-detect detector type from ControlNet model name
+    if detector_type == "auto":
+        if "canny" in controlnet_model.lower():
+            detected_type = "canny"
+        elif "hed" in controlnet_model.lower():
+            detected_type = "hed"
+        elif "openpose" in controlnet_model.lower() or "pose" in controlnet_model.lower():
+            detected_type = "openpose"
+        else:
+            detected_type = "none"  # Unknown model, use input directly
+            print(f"⚠️  Unknown ControlNet type, using input image directly")
+        print(f"🔍 Auto-detected detector: {detected_type}")
     else:
-        print("🕺 Extracting pose from input image...")
-        print("   (Running OpenPose detector separately to save VRAM)")
+        detected_type = detector_type
+    
+    if detected_type == "none":
+        print("📷 Using input as conditioning image directly")
+        conditioning_image = load_image(input_image)
+    elif detected_type == "canny":
+        print("🔲 Extracting Canny edges from input image...")
+        input_img = load_image(input_image)
+        conditioning_image = extract_canny(input_img)
+        
+        # Save extracted conditioning for reference
+        cond_save_path = os.path.join(output_dir, "extracted_canny.png")
+        conditioning_image.save(cond_save_path)
+        print(f"💾 Saved extracted Canny to: {cond_save_path}")
+    elif detected_type == "hed":
+        print("🔲 Extracting HED edges from input image...")
+        from controlnet_aux import HEDdetector
+        
+        hed = HEDdetector.from_pretrained("lllyasviel/Annotators")
+        if device == "cuda":
+            hed = hed.to(device)
+        
+        input_img = load_image(input_image)
+        conditioning_image = extract_hed(input_img, hed)
+        
+        cond_save_path = os.path.join(output_dir, "extracted_hed.png")
+        conditioning_image.save(cond_save_path)
+        print(f"💾 Saved extracted HED to: {cond_save_path}")
+        
+        # Free memory
+        del hed
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+    elif detected_type == "openpose":
+        print("🕺 Extracting OpenPose from input image...")
         from controlnet_aux import OpenposeDetector
         
-        # Load OpenPose detector
         openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
         if device == "cuda":
             openpose = openpose.to(device)
         
-        pose_image = extract_pose(input_image, openpose)
+        input_img = load_image(input_image)
+        conditioning_image = extract_pose(input_img, openpose)
         
-        # Save extracted pose for reference
-        pose_save_path = os.path.join(output_dir, "extracted_pose.png")
-        pose_image.save(pose_save_path)
-        print(f"💾 Saved extracted pose to: {pose_save_path}")
+        cond_save_path = os.path.join(output_dir, "extracted_pose.png")
+        conditioning_image.save(cond_save_path)
+        print(f"💾 Saved extracted pose to: {cond_save_path}")
         
-        # FREE GPU MEMORY: Delete OpenPose detector before loading SD pipeline
-        print("🧹 Clearing OpenPose from GPU memory...")
+        # Free memory
         del openpose
         if device == "cuda":
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        import gc
         gc.collect()
-        print("✅ GPU memory cleared!")
+    else:
+        raise ValueError(f"Unknown detector type: {detected_type}")
     
-    # Resize pose image to target size
-    pose_image = pose_image.resize((width, height))
+    print("✅ Conditioning ready!")
+    
+    # Resize conditioning image to target size
+    conditioning_image = conditioning_image.resize((width, height))
     print()
     
     # =========================================
@@ -398,9 +455,11 @@ def main():
         help="Random seed for reproducibility",
     )
     parser.add_argument(
-        "--use_pose_directly",
-        action="store_true",
-        help="Use input image as pose image directly (skip pose extraction)",
+        "--detector",
+        type=str,
+        default="auto",
+        choices=["auto", "canny", "hed", "openpose", "none"],
+        help="Detector type: auto (detect from model), canny, hed, openpose, or none (use input directly)",
     )
     parser.add_argument(
         "--negative_prompt",
@@ -422,6 +481,7 @@ def main():
         output_dir=args.output_dir,
         model_path=args.model_path,
         controlnet_model=args.controlnet_model,
+        detector_type=args.detector,
         num_images=args.num_images,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
@@ -429,7 +489,6 @@ def main():
         height=args.height,
         width=args.width,
         seed=args.seed,
-        use_pose_image_directly=args.use_pose_directly,
         negative_prompt=args.negative_prompt,
         low_vram_mode=args.low_vram,
     )
