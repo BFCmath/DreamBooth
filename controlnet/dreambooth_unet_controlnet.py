@@ -60,6 +60,7 @@ from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from peft import LoraConfig, get_peft_model
 
 # Local utilities
 from utils import print_vram, extract_conditioning, collate_fn
@@ -368,6 +369,8 @@ def train(
     mixed_precision: bool = True,
     gradient_checkpointing: bool = True,
     use_8bit_adam: bool = True,
+    use_lora: bool = True,  # Use LoRA for memory-efficient training
+    lora_rank: int = 4,  # LoRA rank (4-8 typical for DreamBooth)
     seed: int = 42,
     repeats: int = 20,
 ):
@@ -483,8 +486,22 @@ def train(
     
     # UNet (TRAINABLE - this is where identity learning happens!)
     unet = UNet2DConditionModel.from_pretrained(pretrained_model, subfolder="unet")
-    unet.to(device)  # Keep in float32 for training stability
-    print("   ✅ UNet loaded (TRAINABLE - identity learning)")
+    
+    # Apply LoRA for memory-efficient training
+    if use_lora:
+        print(f"   🔧 Applying LoRA with rank={lora_rank}")
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_rank,  # Typically same as rank
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],  # Attention layers only
+        )
+        unet = get_peft_model(unet, lora_config)
+        unet.print_trainable_parameters()
+        print("   ✅ UNet loaded with LoRA (memory-efficient training)")
+    else:
+        unet.to(device)  # Keep in float32 for training stability
+        print("   ✅ UNet loaded (full fine-tuning)")
     
     # ControlNet (FROZEN - only provides structural conditioning)
     controlnet = ControlNetModel.from_pretrained(controlnet_model)
@@ -502,13 +519,6 @@ def train(
         unet.enable_gradient_checkpointing()
         print("   ✅ UNet gradient checkpointing enabled")
     
-    # Enable xformers memory efficient attention if available
-    try:
-        unet.enable_xformers_memory_efficient_attention()
-        controlnet.enable_xformers_memory_efficient_attention()
-        print("   ✅ Enabled xformers memory efficient attention (UNet + ControlNet)")
-    except Exception as e:
-        print(f"   ⚠️  Could not enable xformers: {e}")
     
     # =========================================
     # Dataset
@@ -568,9 +578,19 @@ def train(
     else:
         optimizer_class = torch.optim.AdamW
     
+    # Get trainable parameters (LoRA only trains a subset)
+    if use_lora:
+        trainable_params = [p for p in unet.parameters() if p.requires_grad]
+        # LoRA typically uses higher learning rate
+        lora_lr = learning_rate if learning_rate >= 1e-4 else 1e-4
+        print(f"   📊 Training {sum(p.numel() for p in trainable_params):,} LoRA parameters (lr={lora_lr})")
+    else:
+        trainable_params = unet.parameters()
+        lora_lr = learning_rate
+    
     optimizer = optimizer_class(
-        unet.parameters(),  # Only UNet parameters!
-        lr=learning_rate,
+        trainable_params,
+        lr=lora_lr,
         betas=(0.9, 0.999),
         weight_decay=0.01,
         eps=1e-8,
@@ -710,10 +730,14 @@ def train(
                 if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
                     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
                     os.makedirs(checkpoint_dir, exist_ok=True)
-                    # Unwrap and save the UNet
+                    # Unwrap and save the UNet/LoRA
                     unet_to_save = accelerator.unwrap_model(unet)
-                    unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
-                    print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
+                    if use_lora:
+                        unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet_lora"))
+                        print(f"\n💾 LoRA checkpoint saved: {checkpoint_dir}/unet_lora")
+                    else:
+                        unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
+                        print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
             
             if global_step >= max_train_steps:
                 break
@@ -732,36 +756,57 @@ def train(
         # Unwrap the trained UNet
         unwrapped_unet = accelerator.unwrap_model(unet)
         
-        # Save the full pipeline with trained UNet
-        from diffusers import StableDiffusionControlNetPipeline
-        
-        pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-            pretrained_model,
-            unet=unwrapped_unet,
-            controlnet=controlnet,
-            text_encoder=text_encoder,
-            vae=vae,
-            tokenizer=tokenizer,
-            safety_checker=None,
-        )
-        pipeline.save_pretrained(output_dir)
-        print(f"✅ Full pipeline saved to: {output_dir}")
-        
-        # Also save just the UNet separately for easy loading
-        unwrapped_unet.save_pretrained(os.path.join(output_dir, "unet_trained"))
-        print(f"✅ Trained UNet also saved to: {output_dir}/unet_trained")
-        
-        print()
-        print("=" * 60)
-        print("✅ Training Complete!")
-        print("=" * 60)
-        print()
-        print("To use your trained model:")
-        print("```python")
-        print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
-        print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{output_dir}")')
-        print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
-        print("```")
+        if use_lora:
+            # Save LoRA weights (small ~5MB files)
+            lora_path = os.path.join(output_dir, "unet_lora")
+            unwrapped_unet.save_pretrained(lora_path)
+            print(f"✅ LoRA weights saved to: {lora_path}")
+            
+            print()
+            print("=" * 60)
+            print("✅ Training Complete!")
+            print("=" * 60)
+            print()
+            print("To use your trained LoRA model:")
+            print("```python")
+            print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
+            print("from peft import PeftModel")
+            print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{pretrained_model}")')
+            print(f'pipe.unet = PeftModel.from_pretrained(pipe.unet, "{lora_path}")')
+            print(f'pipe.controlnet = ControlNetModel.from_pretrained("{controlnet_model}")')
+            print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
+            print("```")
+        else:
+            # Save the full pipeline with trained UNet
+            from diffusers import StableDiffusionControlNetPipeline
+            
+            pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+                pretrained_model,
+                unet=unwrapped_unet,
+                controlnet=controlnet,
+                text_encoder=text_encoder,
+                vae=vae,
+                tokenizer=tokenizer,
+                safety_checker=None,
+            )
+            pipeline.save_pretrained(output_dir)
+            print(f"✅ Full pipeline saved to: {output_dir}")
+            
+            # Also save just the UNet separately for easy loading
+            unwrapped_unet.save_pretrained(os.path.join(output_dir, "unet_trained"))
+            print(f"✅ Trained UNet also saved to: {output_dir}/unet_trained")
+            
+            print()
+            print("=" * 60)
+            print("✅ Training Complete!")
+            print("=" * 60)
+            print()
+            print("To use your trained model:")
+            print("```python")
+            print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
+            print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{output_dir}")')
+            print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
+            print("```")
     
     accelerator.end_training()
 
@@ -808,6 +853,10 @@ def main():
     parser.add_argument("--no_mixed_precision", action="store_true")
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--no_8bit_adam", action="store_true")
+    parser.add_argument("--no_lora", action="store_true",
+                       help="Disable LoRA (full UNet fine-tuning, requires more VRAM)")
+    parser.add_argument("--lora_rank", type=int, default=4,
+                       help="LoRA rank (4-8 typical, higher = more params)")
     
     args = parser.parse_args()
     
@@ -831,6 +880,8 @@ def main():
         mixed_precision=not args.no_mixed_precision,
         gradient_checkpointing=not args.no_gradient_checkpointing,
         use_8bit_adam=not args.no_8bit_adam,
+        use_lora=not args.no_lora,
+        lora_rank=args.lora_rank,
         seed=args.seed,
         repeats=args.repeats,
     )
