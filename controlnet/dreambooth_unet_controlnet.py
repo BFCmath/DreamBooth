@@ -371,6 +371,7 @@ def train(
     use_8bit_adam: bool = True,
     use_lora: bool = True,  # Use LoRA for memory-efficient training
     lora_rank: int = 4,  # LoRA rank (4-8 typical for DreamBooth)
+    train_text_encoder: bool = False,  # Also train text encoder for stronger identity
     seed: int = 42,
     repeats: int = 20,
 ):
@@ -472,11 +473,29 @@ def train(
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model, subfolder="tokenizer")
     print("   ✅ Tokenizer loaded")
     
-    # Text encoder (frozen)
+    # Text encoder
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model, subfolder="text_encoder")
-    text_encoder.requires_grad_(False)
-    text_encoder.to(device, dtype=weight_dtype)
-    print("   ✅ Text encoder loaded (frozen)")
+    
+    # Apply LoRA to text encoder if train_text_encoder is enabled
+    if train_text_encoder and use_lora:
+        print(f"   🔧 Applying LoRA to text encoder with rank={lora_rank}")
+        text_encoder_lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_rank,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "v_proj"],  # Attention layers in CLIP
+        )
+        text_encoder = get_peft_model(text_encoder, text_encoder_lora_config)
+        text_encoder.print_trainable_parameters()
+        print("   ✅ Text encoder loaded with LoRA (TRAINABLE)")
+    elif train_text_encoder:
+        # Full fine-tuning of text encoder
+        text_encoder.to(device)
+        print("   ✅ Text encoder loaded (TRAINABLE - full fine-tuning)")
+    else:
+        text_encoder.requires_grad_(False)
+        text_encoder.to(device, dtype=weight_dtype)
+        print("   ✅ Text encoder loaded (frozen)")
     
     # VAE (frozen)
     vae = AutoencoderKL.from_pretrained(pretrained_model, subfolder="vae")
@@ -581,11 +600,15 @@ def train(
     # Get trainable parameters (LoRA only trains a subset)
     if use_lora:
         trainable_params = [p for p in unet.parameters() if p.requires_grad]
+        if train_text_encoder:
+            trainable_params += [p for p in text_encoder.parameters() if p.requires_grad]
         # LoRA typically uses higher learning rate
         lora_lr = learning_rate if learning_rate >= 1e-4 else 1e-4
         print(f"   📊 Training {sum(p.numel() for p in trainable_params):,} LoRA parameters (lr={lora_lr})")
     else:
-        trainable_params = unet.parameters()
+        trainable_params = list(unet.parameters())
+        if train_text_encoder:
+            trainable_params += list(text_encoder.parameters())
         lora_lr = learning_rate
     
     optimizer = optimizer_class(
@@ -605,13 +628,19 @@ def train(
     print("   ✅ Optimizer and LR scheduler ready")
     
     # Prepare for distributed training
-    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, dataloader, lr_scheduler
-    )
+    if train_text_encoder:
+        unet, text_encoder, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            unet, text_encoder, optimizer, dataloader, lr_scheduler
+        )
+    else:
+        unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, dataloader, lr_scheduler
+        )
     
     # Move frozen models to device
     vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if not train_text_encoder:
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
     controlnet.to(accelerator.device, dtype=weight_dtype)
     
     print(f"   ✅ Models prepared for distributed training on {accelerator.num_processes} GPU(s)")
@@ -760,7 +789,14 @@ def train(
             # Save LoRA weights (small ~5MB files)
             lora_path = os.path.join(output_dir, "unet_lora")
             unwrapped_unet.save_pretrained(lora_path)
-            print(f"✅ LoRA weights saved to: {lora_path}")
+            print(f"✅ UNet LoRA weights saved to: {lora_path}")
+            
+            # Save text encoder LoRA if trained
+            if train_text_encoder:
+                unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+                text_encoder_lora_path = os.path.join(output_dir, "text_encoder_lora")
+                unwrapped_text_encoder.save_pretrained(text_encoder_lora_path)
+                print(f"✅ Text encoder LoRA weights saved to: {text_encoder_lora_path}")
             
             print()
             print("=" * 60)
@@ -773,6 +809,8 @@ def train(
             print("from peft import PeftModel")
             print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{pretrained_model}")')
             print(f'pipe.unet = PeftModel.from_pretrained(pipe.unet, "{lora_path}")')
+            if train_text_encoder:
+                print(f'pipe.text_encoder = PeftModel.from_pretrained(pipe.text_encoder, "{text_encoder_lora_path}")')
             print(f'pipe.controlnet = ControlNetModel.from_pretrained("{controlnet_model}")')
             print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
             print("```")
@@ -857,6 +895,8 @@ def main():
                        help="Disable LoRA (full UNet fine-tuning, requires more VRAM)")
     parser.add_argument("--lora_rank", type=int, default=4,
                        help="LoRA rank (4-8 typical, higher = more params)")
+    parser.add_argument("--train_text_encoder", action="store_true",
+                       help="Also train text encoder for stronger identity learning")
     
     args = parser.parse_args()
     
@@ -882,6 +922,7 @@ def main():
         use_8bit_adam=not args.no_8bit_adam,
         use_lora=not args.no_lora,
         lora_rank=args.lora_rank,
+        train_text_encoder=args.train_text_encoder,
         seed=args.seed,
         repeats=args.repeats,
     )

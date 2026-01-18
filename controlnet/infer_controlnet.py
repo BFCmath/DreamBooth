@@ -60,6 +60,7 @@ def generate_images(
     negative_prompt: str = "lowres, bad anatomy, worst quality, low quality, deformed, ugly",
     low_vram_mode: bool = False,
     unet_lora_path: str = None,  # Path to LoRA weights for UNet
+    text_encoder_lora_path: str = None,  # Path to LoRA weights for text encoder
 ):
     """
     Generate images using ControlNet with various conditioning types.
@@ -219,13 +220,24 @@ def generate_images(
     
     # Load LoRA weights if provided
     if unet_lora_path:
-        print(f"⏳ Loading LoRA weights: {unet_lora_path}")
+        print(f"⏳ Loading UNet LoRA weights: {unet_lora_path}")
         try:
             from peft import PeftModel
             pipe.unet = PeftModel.from_pretrained(pipe.unet, unet_lora_path)
-            print("✅ LoRA weights loaded!")
+            print("✅ UNet LoRA weights loaded!")
         except Exception as e:
-            print(f"❌ Failed to load LoRA weights: {e}")
+            print(f"❌ Failed to load UNet LoRA weights: {e}")
+            raise
+    
+    # Load text encoder LoRA if provided
+    if text_encoder_lora_path:
+        print(f"⏳ Loading text encoder LoRA weights: {text_encoder_lora_path}")
+        try:
+            from peft import PeftModel
+            pipe.text_encoder = PeftModel.from_pretrained(pipe.text_encoder, text_encoder_lora_path)
+            print("✅ Text encoder LoRA weights loaded!")
+        except Exception as e:
+            print(f"❌ Failed to load text encoder LoRA weights: {e}")
             raise
     
     # =========================================
@@ -494,6 +506,12 @@ def main():
         default=None,
         help="Path to LoRA weights for UNet (from DreamBooth LoRA training)",
     )
+    parser.add_argument(
+        "--text_encoder_lora_path",
+        type=str,
+        default=None,
+        help="Path to LoRA weights for text encoder (from DreamBooth LoRA training with --train_text_encoder)",
+    )
     
     args = parser.parse_args()
     print("START")
@@ -514,6 +532,7 @@ def main():
         negative_prompt=args.negative_prompt,
         low_vram_mode=args.low_vram,
         unet_lora_path=args.unet_lora_path,
+        text_encoder_lora_path=args.text_encoder_lora_path,
     )
 
 
