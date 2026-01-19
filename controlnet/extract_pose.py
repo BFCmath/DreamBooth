@@ -64,13 +64,13 @@ def main():
     print("=" * 60)
     print()
     
-    # Load DWPose detector (more accurate than OpenPose)
-    print("⏳ Loading DWPose detector...")
-    from controlnet_aux import DWposeDetector
-    detector = DWposeDetector.from_pretrained("yzd-v/DWPose")
+    # Load OpenPose detector
+    print("⏳ Loading OpenPose detector...")
+    from controlnet_aux import OpenposeDetector
+    detector = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
     if args.device == "cuda":
         detector = detector.to(args.device)
-    print("✅ DWPose detector loaded")
+    print("✅ OpenPose detector loaded")
     print()
     
     # Process each image
