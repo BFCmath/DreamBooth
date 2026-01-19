@@ -859,7 +859,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="./data", help="Data directory")
     parser.add_argument("--output_dir", type=str, default="./output/dreambooth-unet-controlnet")
     parser.add_argument("--pretrained_model", type=str, default="runwayml/stable-diffusion-v1-5")
-    parser.add_argument("--controlnet_model", type=str, default="lllyasviel/control_v11p_sd15_canny",
+    parser.add_argument("--controlnet_model", type=str, default="lllyasviel/control_v11p_sd15_openpose",
                        help="Pretrained ControlNet to use (frozen)")
     
     # DreamBooth parameters
