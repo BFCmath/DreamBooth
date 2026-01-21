@@ -88,6 +88,7 @@ def generate_images(
         
         unet_lora = os.path.join(lora_path, "unet_lora")
         text_encoder_lora = os.path.join(lora_path, "text_encoder_lora")
+        token_embedding_path = os.path.join(lora_path, "token_embedding.pt")
         
         if os.path.exists(unet_lora):
             print(f"⏳ Loading UNet LoRA from {unet_lora}")
@@ -100,6 +101,29 @@ def generate_images(
             print(f"⏳ Loading Text Encoder LoRA from {text_encoder_lora}")
             pipe.text_encoder = PeftModel.from_pretrained(pipe.text_encoder, text_encoder_lora)
             print("✅ Text Encoder LoRA loaded!")
+        elif os.path.exists(token_embedding_path):
+            # Load trained token embedding (Custom Diffusion style)
+            print(f"⏳ Loading trained token embedding from {token_embedding_path}")
+            token_embedding_data = torch.load(token_embedding_path, map_location="cpu")
+            
+            # Get the token embedding layer
+            token_embedding = pipe.text_encoder.text_model.embeddings.token_embedding
+            
+            # Update the embedding weight for the trained token(s)
+            with torch.no_grad():
+                if "token_id" in token_embedding_data:
+                    # Single token embedding
+                    token_id = token_embedding_data["token_id"]
+                    embedding = token_embedding_data["embedding"]
+                    token_embedding.weight[token_id] = embedding.to(token_embedding.weight.dtype)
+                    print(f"✅ Token embedding loaded for token ID {token_id}!")
+                elif "embeddings" in token_embedding_data:
+                    # Multiple token embeddings
+                    for token_id, embedding in token_embedding_data["embeddings"].items():
+                        token_embedding.weight[token_id] = embedding.to(token_embedding.weight.dtype)
+                    print(f"✅ Token embeddings loaded!")
+                else:
+                    print(f"⚠️  Unknown token embedding format")
         else:
             print(f"⚠️  Text Encoder LoRA not found at {text_encoder_lora}")
     

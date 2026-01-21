@@ -339,7 +339,7 @@ def train(
     use_lora: bool = True,
     lora_rank: int = 4,
     custom_diffusion_lora: bool = False,
-    train_text_encoder: bool = True,  # ENABLED by default for Stage 1
+    train_text_encoder: bool = False,  # Also train text encoder for stronger identity
     # Custom Diffusion-style token training
     train_token_embedding: bool = False,  # Train only the placeholder token embedding
     placeholder_token: str = "sks",  # The rare token to use (ID 48136 in CLIP)
@@ -353,6 +353,12 @@ def train(
     Train UNet + Text Encoder WITHOUT ControlNet.
     The model learns to associate "sks" with identity from text alone.
     """
+    
+    # train_token_embedding and train_text_encoder are mutually exclusive
+    # If train_token_embedding is enabled, disable train_text_encoder
+    if train_token_embedding and train_text_encoder:
+        print("⚠️  train_token_embedding enabled - disabling train_text_encoder (they are mutually exclusive)")
+        train_text_encoder = False
     
     print("=" * 60)
     print("🎨 Stage 1: Appearance Control Pretraining")
@@ -761,6 +767,18 @@ def train(
                         if use_lora:
                             text_encoder_to_save.save_pretrained(os.path.join(checkpoint_dir, "text_encoder_lora"))
                             print(f"💾 Text Encoder LoRA checkpoint saved: {checkpoint_dir}/text_encoder_lora")
+                    
+                    # Save token embedding if training it (Custom Diffusion style)
+                    if train_token_embedding and placeholder_token_id is not None:
+                        text_encoder_unwrapped = accelerator.unwrap_model(text_encoder)
+                        token_embedding_weight = text_encoder_unwrapped.text_model.embeddings.token_embedding.weight
+                        token_embedding_data = {
+                            "token_id": placeholder_token_id,
+                            "token": placeholder_token,
+                            "embedding": token_embedding_weight[placeholder_token_id].detach().cpu(),
+                        }
+                        torch.save(token_embedding_data, os.path.join(checkpoint_dir, "token_embedding.pt"))
+                        print(f"💾 Token embedding checkpoint saved: {checkpoint_dir}/token_embedding.pt")
             
             if global_step >= max_train_steps:
                 break
@@ -789,18 +807,30 @@ def train(
                 unwrapped_text_encoder.save_pretrained(text_encoder_lora_path)
                 print(f"✅ Text encoder LoRA weights saved to: {text_encoder_lora_path}")
             
+            # Save token embedding if trained (Custom Diffusion style)
+            if train_token_embedding and placeholder_token_id is not None:
+                text_encoder_unwrapped = accelerator.unwrap_model(text_encoder)
+                token_embedding_weight = text_encoder_unwrapped.text_model.embeddings.token_embedding.weight
+                token_embedding_data = {
+                    "token_id": placeholder_token_id,
+                    "token": placeholder_token,
+                    "embedding": token_embedding_weight[placeholder_token_id].detach().cpu(),
+                }
+                token_embedding_path = os.path.join(output_dir, "token_embedding.pt")
+                torch.save(token_embedding_data, token_embedding_path)
+                print(f"✅ Token embedding saved to: {token_embedding_path}")
+            
             print()
             print("=" * 60)
             print("✅ Stage 1 Training Complete!")
             print("=" * 60)
             print()
-            print("Next step: Run Stage 2 with pose conditioning:")
+            print("Next step: Run inference to test:")
             print("```bash")
-            print(f"python dreambooth_controlnet_stage2.py \\")
-            print(f"    --data_dir ./data_stage2 \\")
-            print(f"    --stage1_lora_path {output_dir} \\")
-            print(f"    --instance_prompt \"{instance_prompt}\" \\")
-            print(f"    --controlnet_model lllyasviel/control_v11p_sd15_openpose")
+            print(f"python infer_stage1.py \\")
+            print(f"    --prompt \"{instance_prompt}\" \\")
+            print(f"    --lora_path {output_dir} \\")
+            print(f"    --num_images 4")
             print("```")
         else:
             unet_path = os.path.join(output_dir, "unet")
@@ -855,8 +885,8 @@ def main():
                        help="LoRA rank (4-8 typical)")
     parser.add_argument("--custom_diffusion_lora", action="store_true",
                        help="Use Custom Diffusion LoRA targets (attn2.to_k, attn2.to_v only)")
-    parser.add_argument("--no_train_text_encoder", action="store_true",
-                       help="Disable text encoder training (NOT recommended for Stage 1)")
+    parser.add_argument("--train_text_encoder", action="store_true",
+                       help="Also train text encoder for stronger identity learning")
     # Custom Diffusion-style token training
     parser.add_argument("--train_token_embedding", action="store_true",
                        help="Train only the placeholder token embedding (Custom Diffusion style)")
@@ -888,7 +918,7 @@ def main():
         use_lora=not args.no_lora,
         lora_rank=args.lora_rank,
         custom_diffusion_lora=args.custom_diffusion_lora,
-        train_text_encoder=not args.no_train_text_encoder,  # ENABLED by default
+        train_text_encoder=args.train_text_encoder,
         train_token_embedding=args.train_token_embedding,
         placeholder_token=args.placeholder_token,
         augment_prompt_for_resize=args.augment_prompt_for_resize,
