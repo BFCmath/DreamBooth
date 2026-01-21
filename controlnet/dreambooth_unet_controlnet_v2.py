@@ -479,6 +479,9 @@ def train(
     lora_rank: int = 4,  # LoRA rank (4-8 typical for DreamBooth)
     custom_diffusion_lora: bool = False,  # Custom Diffusion: only target attn2.to_k, attn2.to_v
     train_text_encoder: bool = False,  # Also train text encoder for stronger identity
+    # Custom Diffusion-style token training
+    train_token_embedding: bool = False,  # Train only the placeholder token embedding
+    placeholder_token: str = "sks",  # The rare token to use (ID 48136 in CLIP)
     augment_prompt_for_resize: bool = False,  # Custom Diffusion: augment prompts for resized images
     seed: int = 42,
     repeats: int = 20,
@@ -584,6 +587,19 @@ def train(
     # Text encoder
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model, subfolder="text_encoder")
     
+    # Get placeholder token ID (Custom Diffusion style - use existing rare token)
+    placeholder_token_id = None
+    if train_token_embedding:
+        # Encode the placeholder token to get its ID
+        placeholder_tokens = tokenizer.encode(placeholder_token, add_special_tokens=False)
+        if len(placeholder_tokens) != 1:
+            raise ValueError(
+                f"Placeholder token '{placeholder_token}' encodes to {len(placeholder_tokens)} tokens. "
+                f"Please choose a single-token identifier."
+            )
+        placeholder_token_id = placeholder_tokens[0]
+        print(f"   🎯 Custom Diffusion mode: training token '{placeholder_token}' (ID: {placeholder_token_id})")
+    
     # Apply LoRA to text encoder if train_text_encoder is enabled
     if train_text_encoder and use_lora:
         print(f"   🔧 Applying LoRA to text encoder with rank={lora_rank}")
@@ -600,6 +616,13 @@ def train(
         # Full fine-tuning of text encoder
         text_encoder.to(device)
         print("   ✅ Text encoder loaded (TRAINABLE - full fine-tuning)")
+    elif train_token_embedding:
+        # Custom Diffusion: freeze all except the token embedding layer
+        text_encoder.requires_grad_(False)
+        # Unfreeze the token embedding layer (we'll mask gradients later)
+        text_encoder.text_model.embeddings.token_embedding.weight.requires_grad = True
+        text_encoder.to(device)  # Keep in float32 for training
+        print(f"   ✅ Text encoder loaded (frozen except '{placeholder_token}' embedding)")
     else:
         text_encoder.requires_grad_(False)
         text_encoder.to(device, dtype=weight_dtype)
@@ -722,13 +745,20 @@ def train(
         trainable_params = [p for p in unet.parameters() if p.requires_grad]
         if train_text_encoder:
             trainable_params += [p for p in text_encoder.parameters() if p.requires_grad]
+        elif train_token_embedding:
+            # Add the token embedding layer (we'll mask gradients in training loop)
+            trainable_params += [text_encoder.text_model.embeddings.token_embedding.weight]
         # LoRA typically uses higher learning rate
         lora_lr = learning_rate if learning_rate >= 1e-4 else 1e-4
         print(f"   📊 Training {sum(p.numel() for p in trainable_params):,} LoRA parameters (lr={lora_lr})")
+        if train_token_embedding:
+            print(f"   📊 + token embedding for '{placeholder_token}' (768 params)")
     else:
         trainable_params = list(unet.parameters())
         if train_text_encoder:
             trainable_params += list(text_encoder.parameters())
+        elif train_token_embedding:
+            trainable_params += [text_encoder.text_model.embeddings.token_embedding.weight]
         lora_lr = learning_rate
     
     optimizer = optimizer_class(
@@ -748,7 +778,7 @@ def train(
     print("   ✅ Optimizer and LR scheduler ready")
     
     # Prepare for distributed training
-    if train_text_encoder:
+    if train_text_encoder or train_token_embedding:
         unet, text_encoder, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             unet, text_encoder, optimizer, dataloader, lr_scheduler
         )
@@ -759,7 +789,7 @@ def train(
     
     # Move frozen models to device
     vae.to(accelerator.device, dtype=weight_dtype)
-    if not train_text_encoder:
+    if not train_text_encoder and not train_token_embedding:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
     controlnet.to(accelerator.device, dtype=weight_dtype)
     
@@ -853,9 +883,25 @@ def train(
                 # Backward with accelerator
                 accelerator.backward(loss)
                 
+                # Custom Diffusion: mask gradients to only update placeholder token
+                if train_token_embedding and placeholder_token_id is not None:
+                    # Get the token embedding gradients
+                    token_embedding = text_encoder.text_model.embeddings.token_embedding
+                    if token_embedding.weight.grad is not None:
+                        # Create a mask that's 1 only for the placeholder token
+                        with torch.no_grad():
+                            mask = torch.zeros_like(token_embedding.weight.grad)
+                            mask[placeholder_token_id] = 1.0
+                            token_embedding.weight.grad.mul_(mask)
+                
                 # Update weights (accelerator handles gradient sync)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                    if train_token_embedding:
+                        # Also clip text encoder gradients
+                        accelerator.clip_grad_norm_(
+                            text_encoder.text_model.embeddings.token_embedding.weight, 1.0
+                        )
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -888,6 +934,17 @@ def train(
                     else:
                         unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
                         print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
+                    
+                    # Save token embedding if training it
+                    if train_token_embedding and placeholder_token_id is not None:
+                        unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+                        token_embedding_path = os.path.join(checkpoint_dir, "token_embedding.pt")
+                        torch.save({
+                            "token": placeholder_token,
+                            "token_id": placeholder_token_id,
+                            "embedding": unwrapped_text_encoder.text_model.embeddings.token_embedding.weight[placeholder_token_id].cpu(),
+                        }, token_embedding_path)
+                        print(f"💾 Token embedding checkpoint saved: {token_embedding_path}")
             
             if global_step >= max_train_steps:
                 break
@@ -919,6 +976,18 @@ def train(
                 unwrapped_text_encoder.save_pretrained(text_encoder_lora_path)
                 print(f"✅ Text encoder LoRA weights saved to: {text_encoder_lora_path}")
             
+            # Save token embedding if trained (Custom Diffusion style)
+            token_embedding_path = None
+            if train_token_embedding and placeholder_token_id is not None:
+                unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+                token_embedding_path = os.path.join(output_dir, "token_embedding.pt")
+                torch.save({
+                    "token": placeholder_token,
+                    "token_id": placeholder_token_id,
+                    "embedding": unwrapped_text_encoder.text_model.embeddings.token_embedding.weight[placeholder_token_id].cpu(),
+                }, token_embedding_path)
+                print(f"✅ Token embedding saved to: {token_embedding_path}")
+            
             print()
             print("=" * 60)
             print("✅ Training Complete!")
@@ -928,10 +997,15 @@ def train(
             print("```python")
             print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
             print("from peft import PeftModel")
+            print("import torch")
             print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{pretrained_model}")')
             print(f'pipe.unet = PeftModel.from_pretrained(pipe.unet, "{lora_path}")')
             if train_text_encoder:
                 print(f'pipe.text_encoder = PeftModel.from_pretrained(pipe.text_encoder, "{text_encoder_lora_path}")')
+            if train_token_embedding:
+                print(f'# Load trained token embedding')
+                print(f'token_data = torch.load("{token_embedding_path}")')
+                print(f'pipe.text_encoder.text_model.embeddings.token_embedding.weight.data[token_data["token_id"]] = token_data["embedding"].to(pipe.device)')
             print(f'pipe.controlnet = ControlNetModel.from_pretrained("{controlnet_model}")')
             print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
             print("```")
@@ -1023,6 +1097,12 @@ def main():
     parser.add_argument("--augment_prompt_for_resize", action="store_true",
                        help="Custom Diffusion: append ', very small' or ', zoomed in' to prompts for resized images")
     
+    # Custom Diffusion style token training
+    parser.add_argument("--train_token_embedding", action="store_true",
+                       help="Train only the placeholder token embedding (Custom Diffusion style)")
+    parser.add_argument("--placeholder_token", type=str, default="sks",
+                       help="Placeholder token to train (must be a single token, e.g. 'sks' = ID 48136)")
+    
     args = parser.parse_args()
     
     train(
@@ -1049,6 +1129,8 @@ def main():
         lora_rank=args.lora_rank,
         custom_diffusion_lora=args.custom_diffusion_lora,
         train_text_encoder=args.train_text_encoder,
+        train_token_embedding=args.train_token_embedding,
+        placeholder_token=args.placeholder_token,
         augment_prompt_for_resize=args.augment_prompt_for_resize,
         seed=args.seed,
         repeats=args.repeats,
