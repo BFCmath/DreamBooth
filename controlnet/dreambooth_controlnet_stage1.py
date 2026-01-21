@@ -34,6 +34,12 @@ Key Hyperparameters:
 - class_prompt: "a photo of person" (for prior preservation)
 - learning_rate: 5e-6 (standard DreamBooth LR)
 - max_train_steps: 800-1200 (more steps since no pose guidance)
+
+Custom Diffusion Mode (--train_token_embedding):
+- Trains only the "sks" token embedding (ID 48136) instead of full text encoder
+- Trains only cross-attention K/V projections in UNet (not Q or out)
+- Follows the Custom Diffusion paper approach for memory-efficient training
+- Reference: https://arxiv.org/pdf/2212.04488v2
 """
 
 import argparse
@@ -334,6 +340,9 @@ def train(
     lora_rank: int = 4,
     custom_diffusion_lora: bool = False,
     train_text_encoder: bool = True,  # ENABLED by default for Stage 1
+    # Custom Diffusion-style token training
+    train_token_embedding: bool = False,  # Train only the placeholder token embedding
+    placeholder_token: str = "sks",  # The rare token to use (ID 48136 in CLIP)
     augment_prompt_for_resize: bool = False,
     seed: int = 42,
     repeats: int = 20,
@@ -428,6 +437,19 @@ def train(
     # Text encoder (TRAINABLE for Stage 1)
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model, subfolder="text_encoder")
     
+    # Get placeholder token ID (Custom Diffusion style - use existing rare token)
+    placeholder_token_id = None
+    if train_token_embedding:
+        # Encode the placeholder token to get its ID
+        placeholder_tokens = tokenizer.encode(placeholder_token, add_special_tokens=False)
+        if len(placeholder_tokens) != 1:
+            raise ValueError(
+                f"Placeholder token '{placeholder_token}' encodes to {len(placeholder_tokens)} tokens. "
+                f"Please choose a single-token identifier."
+            )
+        placeholder_token_id = placeholder_tokens[0]
+        print(f"   🎯 Custom Diffusion mode: training token '{placeholder_token}' (ID: {placeholder_token_id})")
+    
     if train_text_encoder and use_lora:
         print(f"   🔧 Applying LoRA to text encoder with rank={lora_rank}")
         text_encoder_lora_config = LoraConfig(
@@ -442,6 +464,13 @@ def train(
     elif train_text_encoder:
         text_encoder.to(device)
         print("   ✅ Text encoder loaded (TRAINABLE - full fine-tuning)")
+    elif train_token_embedding:
+        # Custom Diffusion: freeze all except the token embedding layer
+        text_encoder.requires_grad_(False)
+        # Unfreeze the token embedding layer (we'll mask gradients later)
+        text_encoder.text_model.embeddings.token_embedding.weight.requires_grad = True
+        text_encoder.to(device)  # Keep in float32 for training
+        print(f"   ✅ Text encoder loaded (frozen except '{placeholder_token}' embedding)")
     else:
         text_encoder.requires_grad_(False)
         text_encoder.to(device, dtype=weight_dtype)
@@ -553,12 +582,19 @@ def train(
         trainable_params = [p for p in unet.parameters() if p.requires_grad]
         if train_text_encoder:
             trainable_params += [p for p in text_encoder.parameters() if p.requires_grad]
+        elif train_token_embedding:
+            # Add the token embedding layer (we'll mask gradients in training loop)
+            trainable_params += [text_encoder.text_model.embeddings.token_embedding.weight]
         lora_lr = learning_rate if learning_rate >= 1e-4 else 1e-4
         print(f"   📊 Training {sum(p.numel() for p in trainable_params):,} LoRA parameters (lr={lora_lr})")
+        if train_token_embedding:
+            print(f"   📊 + token embedding for '{placeholder_token}' (768 params)")
     else:
         trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
         if train_text_encoder:
             trainable_params += list(filter(lambda p: p.requires_grad, text_encoder.parameters()))
+        elif train_token_embedding:
+            trainable_params += [text_encoder.text_model.embeddings.token_embedding.weight]
         lora_lr = learning_rate
     
     optimizer = optimizer_class(
@@ -578,7 +614,7 @@ def train(
     print("   ✅ Optimizer and LR scheduler ready")
     
     # Prepare for distributed training
-    if train_text_encoder:
+    if train_text_encoder or train_token_embedding:
         unet, text_encoder, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             unet, text_encoder, optimizer, dataloader, lr_scheduler
         )
@@ -589,7 +625,7 @@ def train(
     
     # Move frozen models to device
     vae.to(accelerator.device, dtype=weight_dtype)
-    if not train_text_encoder:
+    if not train_text_encoder and not train_token_embedding:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
     
     print(f"   ✅ Models prepared for distributed training on {accelerator.num_processes} GPU(s)")
@@ -669,11 +705,28 @@ def train(
                 
                 accelerator.backward(loss)
                 
+                # Custom Diffusion: mask gradients to only update placeholder token
+                if train_token_embedding and placeholder_token_id is not None:
+                    # Get the token embedding gradients
+                    token_embedding = text_encoder.text_model.embeddings.token_embedding
+                    if token_embedding.weight.grad is not None:
+                        # Create a mask that's 1 only for the placeholder token
+                        with torch.no_grad():
+                            mask = torch.zeros_like(token_embedding.weight.grad)
+                            mask[placeholder_token_id] = 1.0
+                            token_embedding.weight.grad.mul_(mask)
+                
                 if accelerator.sync_gradients:
+                    # Collect all trainable parameters for gradient clipping
+                    # IMPORTANT: Only call clip_grad_norm_ ONCE per optimizer step
                     params_to_clip = list(unet.parameters())
                     if train_text_encoder:
                         params_to_clip += list(text_encoder.parameters())
+                    elif train_token_embedding:
+                        params_to_clip.append(text_encoder.text_model.embeddings.token_embedding.weight)
+                    
                     accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                    
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -804,6 +857,11 @@ def main():
                        help="Use Custom Diffusion LoRA targets (attn2.to_k, attn2.to_v only)")
     parser.add_argument("--no_train_text_encoder", action="store_true",
                        help="Disable text encoder training (NOT recommended for Stage 1)")
+    # Custom Diffusion-style token training
+    parser.add_argument("--train_token_embedding", action="store_true",
+                       help="Train only the placeholder token embedding (Custom Diffusion style)")
+    parser.add_argument("--placeholder_token", type=str, default="sks",
+                       help="The placeholder token to train (default: sks, ID 48136 in CLIP)")
     parser.add_argument("--augment_prompt_for_resize", action="store_true",
                        help="Custom Diffusion: augment prompts for resized images")
     
@@ -831,6 +889,8 @@ def main():
         lora_rank=args.lora_rank,
         custom_diffusion_lora=args.custom_diffusion_lora,
         train_text_encoder=not args.no_train_text_encoder,  # ENABLED by default
+        train_token_embedding=args.train_token_embedding,
+        placeholder_token=args.placeholder_token,
         augment_prompt_for_resize=args.augment_prompt_for_resize,
         seed=args.seed,
         repeats=args.repeats,
