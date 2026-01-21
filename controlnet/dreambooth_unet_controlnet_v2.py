@@ -896,12 +896,15 @@ def train(
                 
                 # Update weights (accelerator handles gradient sync)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                    # Collect all trainable parameters for gradient clipping
+                    # IMPORTANT: Only call clip_grad_norm_ ONCE per optimizer step
+                    # (multiple calls cause "unscale_() already called" error with mixed precision)
+                    params_to_clip = list(unet.parameters())
                     if train_token_embedding:
-                        # Also clip text encoder gradients
-                        accelerator.clip_grad_norm_(
-                            text_encoder.text_model.embeddings.token_embedding.weight, 1.0
-                        )
+                        params_to_clip.append(text_encoder.text_model.embeddings.token_embedding.weight)
+                    
+                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                    
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
