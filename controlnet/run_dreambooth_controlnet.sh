@@ -40,7 +40,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./output/controlnet-dreambooth}"
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-runwayml/stable-diffusion-v1-5}"
 
 # DreamBooth Identity Config
-INSTANCE_PROMPT="${INSTANCE_PROMPT:-a photo of sks person}"
+INSTANCE_PROMPT="${INSTANCE_PROMPT:-a sks humanoid robot}"
 CLASS_PROMPT="${CLASS_PROMPT:-a photo of person}"
 WITH_PRIOR_PRESERVATION="${WITH_PRIOR_PRESERVATION:-true}"
 PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-1.0}"

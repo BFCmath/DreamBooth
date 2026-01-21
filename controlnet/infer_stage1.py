@@ -6,11 +6,11 @@ This script uses standard Stable Diffusion (NO ControlNet) to test
 the Stage 1 trained model which learns identity from text only.
 
 Usage (Before training - baseline):
-    python infer_stage1.py --prompt "a photo of sks person" --output_dir ./before_training
+    python infer_stage1.py --prompt "a sks humanoid robot" --output_dir ./before_training
 
 Usage (After training - with LoRA):
     python infer_stage1.py \
-        --prompt "a photo of sks person" \
+        --prompt "a sks humanoid robot" \
         --lora_path ./output/stage1-appearance \
         --output_dir ./after_training
 
@@ -206,7 +206,7 @@ def main():
         description="Stage 1 Inference: Test identity learning (no ControlNet)"
     )
     parser.add_argument("--prompt", type=str, required=True,
-                        help="Text prompt for generation (e.g., 'a photo of sks person')")
+                        help="Text prompt for generation (e.g., 'a sks humanoid robot')")
     parser.add_argument("--output_dir", type=str, default="./output_stage1_infer",
                         help="Directory to save generated images")
     parser.add_argument("--model_path", type=str, default="runwayml/stable-diffusion-v1-5",

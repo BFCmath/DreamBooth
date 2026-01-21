@@ -3,7 +3,7 @@ step 1:
 !git clone https://github.com/BFCmath/DreamBooth.git
 %cd DreamBooth
 step 2: (manually check if extract pose work)
-!python extract_pose.py --input_dir ./dataset --output_dir ./data --instance_prompt "a photo of sks person"
+!python extract_pose.py --input_dir ./dataset --output_dir ./data --instance_prompt "a sks humanoid robot"
 step 3: check normal without dreambooth, what is the output
 !python infer_controlnet.py \
     --prompt "a photo of person wearing jacket, high quality" \
@@ -16,7 +16,7 @@ step 4: train
 !python dreambooth_controlnet.py \
     --data_dir ./data \
     --output_dir ./output/controlnet-openpose-dreambooth \
-    --instance_prompt "a photo of sks person" \
+    --instance_prompt "a sks humanoid robot" \
     --class_prompt "a photo of person" \
     --with_prior_preservation \
     --num_class_images 100 \
@@ -29,7 +29,7 @@ step 4: train
 step 5: infer finetuned model
 # Inference with trained ControlNet (after training)
 !python infer_controlnet.py \
-    --prompt "a photo of sks person" \
+    --prompt "a sks humanoid robot" \
     --input_image ./data/conditioning/001.png \
     --controlnet_model ./output/controlnet-openpose-dreambooth \
     --detector none \

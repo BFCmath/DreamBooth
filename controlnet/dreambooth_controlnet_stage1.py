@@ -30,7 +30,7 @@ Dataset Structure Required:
     └── prompts.txt           # Optional: One prompt per line
 
 Key Hyperparameters:
-- instance_prompt: "a photo of sks person" (sks is the rare token identifier)
+- instance_prompt: "a sks humanoid robot" (sks is the rare token identifier)
 - class_prompt: "a photo of person" (for prior preservation)
 - learning_rate: 5e-6 (standard DreamBooth LR)
 - max_train_steps: 800-1200 (more steps since no pose guidance)
@@ -315,7 +315,7 @@ def train(
     output_dir: str = "./output/stage1-appearance",
     pretrained_model: str = "runwayml/stable-diffusion-v1-5",
     # DreamBooth-specific parameters
-    instance_prompt: str = "a photo of sks person",
+    instance_prompt: str = "a sks humanoid robot",
     class_prompt: str = "a photo of person",
     with_prior_preservation: bool = True,
     prior_loss_weight: float = 1.0,
@@ -768,7 +768,7 @@ def main():
     parser.add_argument("--pretrained_model", type=str, default="runwayml/stable-diffusion-v1-5")
     
     # DreamBooth parameters
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person",
+    parser.add_argument("--instance_prompt", type=str, default="a sks humanoid robot",
                        help="Prompt with rare identifier for the instance")
     parser.add_argument("--class_prompt", type=str, default="a photo of person",
                        help="General class prompt for prior preservation")

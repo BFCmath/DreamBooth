@@ -94,7 +94,7 @@ def main():
                         help="Directory with input images")
     parser.add_argument("--output_dir", type=str, default="./data_stage1", 
                         help="Output directory for dataset")
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person", 
+    parser.add_argument("--instance_prompt", type=str, default="a sks humanoid robot", 
                         help="Instance prompt for training")
     parser.add_argument("--resolution", type=int, default=None,
                         help="Resize images to this resolution (e.g., 512)")

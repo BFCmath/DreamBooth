@@ -80,7 +80,7 @@ class DreamBoothControlNetDataset(Dataset):
     Expects:
     - instance_images_dir: directory with instance images (001.png, 002.png, ...)
     - conditioning_dir: directory with conditioning images (same names as instance)
-    - instance_prompt: prompt with rare identifier (e.g., "a photo of sks person")
+    - instance_prompt: prompt with rare identifier (e.g., "a sks humanoid robot")
     
     Optional for prior preservation:
     - class_images_dir: directory with class images
@@ -374,7 +374,7 @@ def train(
     output_dir: str = "./output/controlnet-dreambooth",
     pretrained_model: str = "runwayml/stable-diffusion-v1-5",
     # DreamBooth-specific parameters
-    instance_prompt: str = "a photo of sks person",
+    instance_prompt: str = "a sks humanoid robot",
     class_prompt: str = "a photo of person",
     with_prior_preservation: bool = True,
     prior_loss_weight: float = 1.0,
@@ -406,7 +406,7 @@ def train(
         pretrained_model: Base SD model to use
         
         # DreamBooth parameters
-        instance_prompt: Prompt with rare identifier (e.g., "a photo of sks person")
+        instance_prompt: Prompt with rare identifier (e.g., "a sks humanoid robot")
         class_prompt: General class prompt (e.g., "a photo of person")
         with_prior_preservation: Enable prior preservation loss
         prior_loss_weight: Weight of prior preservation loss (default 1.0)
@@ -790,7 +790,7 @@ def main():
     parser.add_argument("--pretrained_model", type=str, default="runwayml/stable-diffusion-v1-5")
     
     # DreamBooth parameters
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person",
+    parser.add_argument("--instance_prompt", type=str, default="a sks humanoid robot",
                        help="Prompt with rare identifier for the instance")
     parser.add_argument("--class_prompt", type=str, default="a photo of person",
                        help="General class prompt for prior preservation")

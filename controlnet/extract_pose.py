@@ -33,7 +33,7 @@ def main():
     parser = argparse.ArgumentParser(description="Extract OpenPose from local images")
     parser.add_argument("--input_dir", type=str, required=True, help="Directory with input images")
     parser.add_argument("--output_dir", type=str, default="./data", help="Output directory for dataset")
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person", help="Instance prompt")
+    parser.add_argument("--instance_prompt", type=str, default="a sks humanoid robot", help="Instance prompt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     
     args = parser.parse_args()

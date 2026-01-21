@@ -32,7 +32,7 @@ Dataset Structure Required:
 
 Key Hyperparameters:
 - stage1_lora_path: Path to Stage 1 trained LoRA weights
-- instance_prompt: "a photo of sks person" (same as Stage 1)
+- instance_prompt: "a sks humanoid robot" (same as Stage 1)
 - learning_rate: 1e-5 (higher for ControlNet training)
 - max_train_steps: 500-800 (fewer steps - leveraging Stage 1)
 """
@@ -374,7 +374,7 @@ def train(
     controlnet_model: str = "lllyasviel/control_v11p_sd15_openpose",
     stage1_lora_path: str = None,  # Path to Stage 1 trained LoRA
     # DreamBooth-specific parameters
-    instance_prompt: str = "a photo of sks person",
+    instance_prompt: str = "a sks humanoid robot",
     class_prompt: str = "a photo of person",
     with_prior_preservation: bool = True,
     prior_loss_weight: float = 1.0,
@@ -930,7 +930,7 @@ def main():
                        help="Path to Stage 1 trained LoRA weights (contains unet_lora/ and text_encoder_lora/)")
     
     # DreamBooth parameters
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person",
+    parser.add_argument("--instance_prompt", type=str, default="a sks humanoid robot",
                        help="Prompt with rare identifier (same as Stage 1)")
     parser.add_argument("--class_prompt", type=str, default="a photo of person",
                        help="General class prompt for prior preservation")
