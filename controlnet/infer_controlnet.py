@@ -61,6 +61,7 @@ def generate_images(
     low_vram_mode: bool = False,
     unet_lora_path: str = None,  # Path to LoRA weights for UNet
     text_encoder_lora_path: str = None,  # Path to LoRA weights for text encoder
+    token_embedding_path: str = None,  # Path to token embedding (from --train_token_embedding)
 ):
     """
     Generate images using ControlNet with various conditioning types.
@@ -238,6 +239,24 @@ def generate_images(
             print("✅ Text encoder LoRA weights loaded!")
         except Exception as e:
             print(f"❌ Failed to load text encoder LoRA weights: {e}")
+            raise
+    
+    # Load token embedding if provided (Custom Diffusion style)
+    if token_embedding_path:
+        print(f"⏳ Loading token embedding: {token_embedding_path}")
+        try:
+            token_data = torch.load(token_embedding_path, map_location="cpu")
+            token_id = token_data["token_id"]
+            embedding = token_data["embedding"]
+            
+            # Update the token embedding in the text encoder
+            pipe.text_encoder.text_model.embeddings.token_embedding.weight.data[token_id] = embedding.to(
+                pipe.text_encoder.text_model.embeddings.token_embedding.weight.device
+            ).to(pipe.text_encoder.text_model.embeddings.token_embedding.weight.dtype)
+            
+            print(f"✅ Token embedding loaded for '{token_data['token']}' (ID: {token_id})")
+        except Exception as e:
+            print(f"❌ Failed to load token embedding: {e}")
             raise
     
     # =========================================
@@ -512,6 +531,12 @@ def main():
         default=None,
         help="Path to LoRA weights for text encoder (from DreamBooth LoRA training with --train_text_encoder)",
     )
+    parser.add_argument(
+        "--token_embedding_path",
+        type=str,
+        default=None,
+        help="Path to token embedding file (from --train_token_embedding, e.g., token_embedding.pt)",
+    )
     
     args = parser.parse_args()
     print("START")
@@ -533,6 +558,7 @@ def main():
         low_vram_mode=args.low_vram,
         unet_lora_path=args.unet_lora_path,
         text_encoder_lora_path=args.text_encoder_lora_path,
+        token_embedding_path=args.token_embedding_path,
     )
 
 
