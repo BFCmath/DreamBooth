@@ -1,41 +1,40 @@
 #!/usr/bin/env python3
 """
-Custom Diffusion: Multi-Concept Customization of Text-to-Image Diffusion
+Stage 2: Appearance-Disentangled Pose Control
 
-DreamBooth + ControlNet Training Script (UNet Training Mode)
+This script trains the Pose ControlNet while fine-tuning the UNet + Text Encoder
+(loaded from Stage 1). The goal is to teach pose control WITHOUT overriding 
+the appearance learned in Stage 1.
 
-This script trains the UNet for identity learning while using a FROZEN pretrained
-ControlNet for structural conditioning. This is the CORRECT approach for 
-identity-oriented fine-tuning with ControlNet.
-
-Key difference from dreambooth_controlnet.py:
-- UNet is TRAINED (identity learning happens here)
-- ControlNet is FROZEN (only provides structural conditioning)
+Key features:
+- Loads Stage 1 trained LoRA (UNet + Text Encoder)
+- ControlNet is TRAINABLE (pretrained base, learning pose control)
+- UNet continues fine-tuning (preserving identity)
 
 This approach:
-1. Preserves the base ControlNet's conditioning capabilities
-2. Allows UNet to learn the specific identity (sks token binding)
-3. Uses prior preservation to prevent catastrophic forgetting
+1. Leverages Stage 1's identity learning
+2. Teaches ControlNet to control structure without re-learning appearance
+3. Disentangles motion/pose from identity
 
 Based on:
-- DreamBooth paper: https://arxiv.org/abs/2208.12242
+- MagicPose paper: https://arxiv.org/pdf/2311.12052
 - ControlNet paper: https://arxiv.org/abs/2302.05543
 
 Dataset Structure Required:
     data/
-    ├── instance_images/      # Instance images (the identity you want to learn)
+    ├── instance_images/      # Instance images (3+ images with extractable poses)
     │   ├── 001.png
     │   └── ...
-    ├── conditioning/         # Conditioning images (pose/edges) for each instance
+    ├── conditioning/         # Pose images (OpenPose format)
     │   ├── 001.png           # Must match instance image names
     │   └── ...
     └── prompts.txt           # Optional: One prompt per line
 
 Key Hyperparameters:
-- instance_prompt: "a photo of sks cat" (sks is the rare token identifier)
-- class_prompt: "a photo of cat" (for prior preservation)
-- learning_rate: 5e-6 (standard DreamBooth LR)
-- max_train_steps: 400-800 (typical for DreamBooth)
+- stage1_lora_path: Path to Stage 1 trained LoRA weights
+- instance_prompt: "a photo of sks person" (same as Stage 1)
+- learning_rate: 1e-5 (higher for ControlNet training)
+- max_train_steps: 500-800 (fewer steps - leveraging Stage 1)
 """
 
 import argparse
@@ -62,22 +61,20 @@ from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 
 # Local utilities
-from utils import print_vram, extract_conditioning, collate_fn
+from utils import print_vram, collate_fn
 
 
 # =============================================================================
-# Dataset for DreamBooth + ControlNet
+# Dataset for Stage 2 (With Conditioning)
 # =============================================================================
-class DreamBoothControlNetDataset(Dataset):
+class Stage2Dataset(Dataset):
     """
-    Dataset for DreamBooth-style training with ControlNet conditioning.
+    Dataset for Stage 2 pose control training.
     
-    Combines:
-    - Instance images (the specific identity to learn) with conditioning
-    - Class images (for prior preservation) with conditioning
+    Requires conditioning images (poses) for each instance image.
     """
     
     def __init__(
@@ -92,7 +89,7 @@ class DreamBoothControlNetDataset(Dataset):
         prompts_file: str = None,
         resolution: int = 512,
         repeats: int = 1,
-        augment_prompt_for_resize: bool = False,  # Custom Diffusion: augment prompts for small/cropped images
+        augment_prompt_for_resize: bool = False,
     ):
         self.instance_images_dir = Path(instance_images_dir)
         self.conditioning_dir = Path(conditioning_dir)
@@ -147,71 +144,39 @@ class DreamBoothControlNetDataset(Dataset):
         
         print(f"📊 Total dataset length: {self._length}")
         
-        # Custom Diffusion random scale range (0.4 to 1.4)
+        # Custom Diffusion augmentation settings
         self.scale_min = 0.4
         self.scale_max = 1.4
-        
-        # Fill color for padding (gray = 128/255 ≈ 0.5)
         self.pad_fill_color = (128, 128, 128)
     
     def __len__(self):
         return self._length
     
     def _apply_custom_diffusion_augmentation(self, image: Image.Image, cond_image: Image.Image):
-        """
-        Apply Custom Diffusion random scale augmentation to BOTH image and conditioning.
-        
-        From the paper:
-        - Random scale between 0.4 and 1.4
-        - If scale < 1.0: Shrink image, pad with grey → "very small, far away"
-        - If scale > 1.0: Enlarge and center crop → "zoomed in, close up"
-        
-        CRITICAL: Same transform is applied to BOTH image and conditioning!
-        
-        Returns:
-            augmented_image: PIL Image at resolution x resolution
-            augmented_cond: PIL Image at resolution x resolution  
-            scale_factor: The random scale used (for prompt augmentation)
-        """
+        """Apply Custom Diffusion random scale augmentation to BOTH images."""
         import random
         
-        # Sample random scale factor
         scale_factor = random.uniform(self.scale_min, self.scale_max)
-        
-        # Both images should be resized to same base size first
-        # We'll work at the target resolution
         base_size = self.resolution
         
         if scale_factor < 1.0:
-            # SHRINK: Make object appear smaller/farther
-            # Shrink the image, then pad to fill resolution
             new_size = int(base_size * scale_factor)
-            
-            # Resize both images to smaller size
             resized_image = image.resize((new_size, new_size), Image.BILINEAR)
             resized_cond = cond_image.resize((new_size, new_size), Image.BILINEAR)
             
-            # Create padded images with grey background
             padded_image = Image.new("RGB", (base_size, base_size), self.pad_fill_color)
             padded_cond = Image.new("RGB", (base_size, base_size), self.pad_fill_color)
             
-            # Center the resized image
             offset = (base_size - new_size) // 2
             padded_image.paste(resized_image, (offset, offset))
             padded_cond.paste(resized_cond, (offset, offset))
             
             return padded_image, padded_cond, scale_factor
-            
         else:
-            # ENLARGE & CROP: Make object appear larger/closer (zoomed in)
-            # Enlarge the image, then center crop to resolution
             new_size = int(base_size * scale_factor)
-            
-            # Resize both images to larger size
             resized_image = image.resize((new_size, new_size), Image.BILINEAR)
             resized_cond = cond_image.resize((new_size, new_size), Image.BILINEAR)
             
-            # Center crop back to resolution
             offset = (new_size - base_size) // 2
             cropped_image = resized_image.crop((offset, offset, offset + base_size, offset + base_size))
             cropped_cond = resized_cond.crop((offset, offset, offset + base_size, offset + base_size))
@@ -219,17 +184,7 @@ class DreamBoothControlNetDataset(Dataset):
             return cropped_image, cropped_cond, scale_factor
     
     def _load_image_and_conditioning(self, image_path, cond_dir, apply_augmentation=True):
-        """
-        Load an image and its corresponding conditioning image.
-        
-        If augment_prompt_for_resize is enabled, applies Custom Diffusion 
-        random scale augmentation to BOTH images with the same transform.
-        
-        Returns:
-            pixel_values: Transformed image tensor
-            conditioning_pixel_values: Transformed conditioning tensor
-            scale_factor: The scale factor used (for prompt augmentation)
-        """
+        """Load an image and its corresponding conditioning image."""
         image = Image.open(image_path).convert("RGB")
         
         # Find conditioning image
@@ -243,35 +198,25 @@ class DreamBoothControlNetDataset(Dataset):
         
         cond_image = Image.open(cond_path).convert("RGB")
         
-        # First, resize both images to the target resolution (base preprocessing)
+        # Resize to target resolution
         image = image.resize((self.resolution, self.resolution), Image.BILINEAR)
         cond_image = cond_image.resize((self.resolution, self.resolution), Image.BILINEAR)
         
-        # Apply Custom Diffusion augmentation if enabled
-        scale_factor = 1.0  # No augmentation by default
+        scale_factor = 1.0
         if self.augment_prompt_for_resize and apply_augmentation:
             image, cond_image, scale_factor = self._apply_custom_diffusion_augmentation(
                 image, cond_image
             )
         
         # Convert to tensors
-        # Image: normalize to [-1, 1] for diffusion model
         image_tensor = transforms.ToTensor()(image)
         pixel_values = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])(image_tensor)
-        
-        # Conditioning: just [0, 1] range
         conditioning_pixel_values = transforms.ToTensor()(cond_image)
         
         return pixel_values, conditioning_pixel_values, scale_factor
     
     def _get_prompt_suffix(self, scale_factor: float) -> str:
-        """
-        Get prompt suffix based on scale factor (Custom Diffusion technique).
-        
-        - scale < 1.0: Object is shrunk → ", very small, far away"
-        - scale > 1.0: Object is zoomed → ", zoomed in, close up"
-        - scale ≈ 1.0: No suffix
-        """
+        """Get prompt suffix based on scale factor."""
         if scale_factor < 0.9:
             return ", very small, far away"
         elif scale_factor > 1.1:
@@ -298,7 +243,6 @@ class DreamBoothControlNetDataset(Dataset):
         else:
             prompt = self.instance_prompt
         
-        # Apply Custom Diffusion prompt augmentation based on scale factor
         if self.augment_prompt_for_resize:
             suffix = self._get_prompt_suffix(scale_factor)
             if suffix:
@@ -313,7 +257,6 @@ class DreamBoothControlNetDataset(Dataset):
         ).input_ids.squeeze(0)
         
         # Class image (for prior preservation)
-        # Note: Class images don't get augmentation to maintain stable regularization
         if self.num_class_images > 0:
             class_idx = idx % self.num_class_images
             class_path = self.class_images[class_idx]
@@ -342,32 +285,19 @@ class DreamBoothControlNetDataset(Dataset):
 
 
 # =============================================================================
-# Class Image Generation (for Prior Preservation)
+# Class Image Generation (with ControlNet)
 # =============================================================================
-def generate_class_images(
+def generate_class_images_stage2(
     class_images_dir: str,
     class_conditioning_dir: str,
-    instance_conditioning_dir: str,  # NEW: Use instance conditioning for class generation
+    instance_conditioning_dir: str,
     class_prompt: str,
     num_class_images: int,
     pretrained_model: str,
-    controlnet_path: str,  # REQUIRED: Need ControlNet for conditioned generation
+    controlnet_path: str,
     device: str = "cuda",
-    sample_batch_size: int = 1,  # Lower default for ControlNet pipeline
 ):
-    """
-    Generate class images using the SAME conditioning as instance images.
-    
-    This is crucial for proper DreamBooth + ControlNet training:
-    - Instance: (instance_image, pose_i, "sks cat") 
-    - Class:   (class_image, pose_i, "cat")  <- SAME pose!
-    
-    The prior preservation loss then teaches:
-    - "sks" modifier means this specific identity
-    - Pose control is preserved because both use the same conditioning
-    """
-    import shutil
-    
+    """Generate class images using ControlNet for conditioning."""
     class_dir = Path(class_images_dir)
     class_dir.mkdir(parents=True, exist_ok=True)
     
@@ -376,17 +306,15 @@ def generate_class_images(
     
     instance_cond_dir = Path(instance_conditioning_dir)
     
-    # Count existing images
     existing_images = list(class_dir.glob("*.png")) + list(class_dir.glob("*.jpg"))
     cur_class_images = len(existing_images)
     
     if cur_class_images >= num_class_images:
         existing_cond = list(cond_dir.glob("*.png")) + list(cond_dir.glob("*.jpg"))
         if len(existing_cond) >= num_class_images:
-            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning (needed {num_class_images})")
+            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning")
             return
     
-    # Load instance conditioning images
     instance_cond_files = sorted([
         f for f in instance_cond_dir.iterdir()
         if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']
@@ -396,12 +324,8 @@ def generate_class_images(
         raise ValueError(f"No conditioning images found in {instance_conditioning_dir}")
     
     num_to_generate = num_class_images - cur_class_images
-    print(f"📸 Generating {num_to_generate} class images with prompt: '{class_prompt}'")
-    print(f"   🎯 Using instance conditioning for proper prior preservation!")
-    print(f"   📂 Instance conditioning dir: {instance_conditioning_dir}")
-    print(f"   📂 ControlNet: {controlnet_path}")
+    print(f"📸 Generating {num_to_generate} class images with ControlNet conditioning")
     
-    # Load ControlNet pipeline for conditioned generation
     controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch.float16)
     
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
@@ -413,17 +337,12 @@ def generate_class_images(
     pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     
-    generated = 0
-    
-    for idx in tqdm(range(num_to_generate), desc="Generating class images with instance conditioning"):
-        # Cycle through instance conditioning images
+    for idx in tqdm(range(num_to_generate), desc="Generating class images"):
         cond_idx = (cur_class_images + idx) % len(instance_cond_files)
         cond_file = instance_cond_files[cond_idx]
         
-        # Load conditioning image
         cond_image = Image.open(cond_file).convert("RGB")
         
-        # Generate class image using the SAME conditioning as instance
         image = pipeline(
             prompt=class_prompt,
             image=cond_image,
@@ -431,36 +350,32 @@ def generate_class_images(
             guidance_scale=7.5,
         ).images[0]
         
-        # Save class image
-        class_image_idx = cur_class_images + idx
-        image_path = class_dir / f"class_{class_image_idx:04d}.png"
+        image_path = class_dir / f"class_{cur_class_images + idx:04d}.png"
         image.save(image_path)
         
-        # Copy/save the conditioning (same as instance conditioning)
-        cond_path = cond_dir / f"class_{class_image_idx:04d}.png"
-        cond_image.save(cond_path)  # Save the conditioning we used
-        
-        generated += 1
+        cond_path = cond_dir / f"class_{cur_class_images + idx:04d}.png"
+        cond_image.save(cond_path)
     
     del pipeline
     del controlnet
     torch.cuda.empty_cache()
     gc.collect()
     
-    print(f"✅ Generated {num_to_generate} class images using instance conditioning")
+    print(f"✅ Generated {num_to_generate} class images")
 
 
 # =============================================================================
-# Training Function - TRAINS UNET (not ControlNet)
+# Training Function - Stage 2: Pose Control with Trainable ControlNet
 # =============================================================================
 def train(
     data_dir: str = "./data",
-    output_dir: str = "./output/dreambooth-unet-controlnet",
+    output_dir: str = "./output/stage2-pose",
     pretrained_model: str = "runwayml/stable-diffusion-v1-5",
-    controlnet_model: str = "lllyasviel/control_v11p_sd15_canny",
+    controlnet_model: str = "lllyasviel/control_v11p_sd15_openpose",
+    stage1_lora_path: str = None,  # Path to Stage 1 trained LoRA
     # DreamBooth-specific parameters
-    instance_prompt: str = "a photo of sks cat",
-    class_prompt: str = "a photo of cat",
+    instance_prompt: str = "a photo of sks person",
+    class_prompt: str = "a photo of person",
     with_prior_preservation: bool = True,
     prior_loss_weight: float = 1.0,
     num_class_images: int = 100,
@@ -469,64 +384,64 @@ def train(
     resolution: int = 512,
     train_batch_size: int = 1,
     gradient_accumulation_steps: int = 4,
-    learning_rate: float = 5e-6,  # Standard DreamBooth LR for UNet
-    max_train_steps: int = 800,
+    learning_rate: float = 1e-5,  # Higher LR for ControlNet training
+    controlnet_learning_rate: float = 1e-5,  # Separate LR for ControlNet
+    max_train_steps: int = 600,  # Fewer steps - leveraging Stage 1
     checkpointing_steps: int = 200,
     mixed_precision: bool = True,
     gradient_checkpointing: bool = True,
     use_8bit_adam: bool = True,
-    use_lora: bool = True,  # Use LoRA for memory-efficient training
-    lora_rank: int = 4,  # LoRA rank (4-8 typical for DreamBooth)
-    custom_diffusion_lora: bool = False,  # Custom Diffusion: only target attn2.to_k, attn2.to_v
-    train_text_encoder: bool = False,  # Also train text encoder for stronger identity
-    augment_prompt_for_resize: bool = False,  # Custom Diffusion: augment prompts for resized images
+    use_lora: bool = True,
+    lora_rank: int = 4,
+    custom_diffusion_lora: bool = False,
+    train_text_encoder: bool = True,  # Continue training text encoder
+    train_controlnet: bool = True,  # Train ControlNet (Stage 2 key feature!)
+    augment_prompt_for_resize: bool = False,
     seed: int = 42,
     repeats: int = 20,
 ):
     """
-    Train UNet with DreamBooth technique using frozen ControlNet for conditioning.
+    Stage 2: Appearance-Disentangled Pose Control
     
-    This is the CORRECT approach for identity-oriented fine-tuning:
-    - UNet learns the identity (sks token binding)
-    - ControlNet provides structural conditioning (frozen)
+    Train ControlNet for pose control while preserving identity from Stage 1.
+    Loads Stage 1 LoRA weights for UNet + Text Encoder.
     """
     
     print("=" * 60)
-    print("DreamBooth + ControlNet (UNet Training Mode)")
+    print("🎭 Stage 2: Appearance-Disentangled Pose Control")
     print("=" * 60)
     print()
-    print("🔑 KEY DIFFERENCE: This trains UNET for identity learning!")
-    print("   ControlNet is FROZEN (only provides structural guidance)")
+    print("🔑 KEY: ControlNet is TRAINABLE (learning pose control)!")
+    print("   Loading Stage 1 LoRA for identity preservation")
     print()
     print(f"Data directory: {data_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Base model: {pretrained_model}")
     print(f"ControlNet: {controlnet_model}")
+    print(f"Stage 1 LoRA: {stage1_lora_path}")
     print()
-    print("DreamBooth Configuration:")
+    print("Stage 2 Configuration:")
     print(f"  Instance prompt: {instance_prompt}")
     print(f"  Class prompt: {class_prompt}")
     print(f"  Prior preservation: {with_prior_preservation}")
-    print(f"  Prior loss weight: {prior_loss_weight}")
-    print(f"  Num class images: {num_class_images}")
+    print(f"  Train ControlNet: {train_controlnet}")
+    print(f"  Train text encoder: {train_text_encoder}")
     print()
     print("Training Configuration:")
     print(f"  Resolution: {resolution}")
     print(f"  Batch size: {train_batch_size}")
-    print(f"  Gradient accumulation: {gradient_accumulation_steps}")
-    print(f"  Learning rate: {learning_rate}")
+    print(f"  UNet/Text LR: {learning_rate}")
+    print(f"  ControlNet LR: {controlnet_learning_rate}")
     print(f"  Max steps: {max_train_steps}")
-    print(f"  Instance repeats: {repeats}")
     print("=" * 60)
     print()
     
-    # Setup Accelerator for multi-GPU training
+    # Setup Accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision="fp16" if mixed_precision else "no",
     )
     
-    # Only create output dir on main process
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
     
@@ -545,7 +460,6 @@ def train(
     # Generate Class Images (if needed)
     # =========================================
     if with_prior_preservation:
-        # Only generate class images on main process
         if accelerator.is_main_process:
             print("=" * 60)
             print("Phase 1: Generating class images for prior preservation")
@@ -555,7 +469,7 @@ def train(
             class_conditioning_dir = data_path / "class_conditioning"
             instance_conditioning_dir = data_path / "conditioning"
             
-            generate_class_images(
+            generate_class_images_stage2(
                 class_images_dir=str(class_images_dir),
                 class_conditioning_dir=str(class_conditioning_dir),
                 instance_conditioning_dir=str(instance_conditioning_dir),
@@ -563,10 +477,8 @@ def train(
                 num_class_images=num_class_images,
                 pretrained_model=pretrained_model,
                 controlnet_path=controlnet_model,
-                device="cuda",  # Use cuda directly for class generation
-                sample_batch_size=sample_batch_size,
+                device="cuda",
             )
-        # Wait for class images to be generated before all processes continue
         accelerator.wait_for_everyone()
         print()
     
@@ -581,25 +493,32 @@ def train(
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model, subfolder="tokenizer")
     print("   ✅ Tokenizer loaded")
     
-    # Text encoder
+    # Text encoder - load Stage 1 LoRA if available
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model, subfolder="text_encoder")
     
-    # Apply LoRA to text encoder if train_text_encoder is enabled
-    if train_text_encoder and use_lora:
-        print(f"   🔧 Applying LoRA to text encoder with rank={lora_rank}")
+    if stage1_lora_path and os.path.exists(os.path.join(stage1_lora_path, "text_encoder_lora")):
+        text_encoder_lora_path = os.path.join(stage1_lora_path, "text_encoder_lora")
+        print(f"   🔄 Loading Stage 1 Text Encoder LoRA from {text_encoder_lora_path}")
+        text_encoder = PeftModel.from_pretrained(text_encoder, text_encoder_lora_path)
+        
+        if train_text_encoder:
+            # Unfreeze for continued training
+            for param in text_encoder.parameters():
+                param.requires_grad = True
+            print("   ✅ Text encoder loaded with Stage 1 LoRA (TRAINABLE)")
+        else:
+            text_encoder.requires_grad_(False)
+            print("   ✅ Text encoder loaded with Stage 1 LoRA (frozen)")
+    elif train_text_encoder and use_lora:
+        print(f"   🔧 Applying fresh LoRA to text encoder with rank={lora_rank}")
         text_encoder_lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_rank,
             init_lora_weights="gaussian",
-            target_modules=["q_proj", "v_proj"],  # Attention layers in CLIP
+            target_modules=["q_proj", "v_proj"],
         )
         text_encoder = get_peft_model(text_encoder, text_encoder_lora_config)
-        text_encoder.print_trainable_parameters()
-        print("   ✅ Text encoder loaded with LoRA (TRAINABLE)")
-    elif train_text_encoder:
-        # Full fine-tuning of text encoder
-        text_encoder.to(device)
-        print("   ✅ Text encoder loaded (TRAINABLE - full fine-tuning)")
+        print("   ✅ Text encoder loaded with fresh LoRA (TRAINABLE)")
     else:
         text_encoder.requires_grad_(False)
         text_encoder.to(device, dtype=weight_dtype)
@@ -611,41 +530,55 @@ def train(
     vae.to(device, dtype=weight_dtype)
     print("   ✅ VAE loaded (frozen)")
     
-    # UNet (TRAINABLE - this is where identity learning happens!)
+    # UNet - load Stage 1 LoRA if available
     unet = UNet2DConditionModel.from_pretrained(pretrained_model, subfolder="unet")
     
-    # Apply LoRA for memory-efficient training
-    if use_lora:
-        # Custom Diffusion paper: only train cross-attention K and V projections
-        # This is more parameter-efficient and works well for concept learning
+    if stage1_lora_path and os.path.exists(os.path.join(stage1_lora_path, "unet_lora")):
+        unet_lora_path = os.path.join(stage1_lora_path, "unet_lora")
+        print(f"   🔄 Loading Stage 1 UNet LoRA from {unet_lora_path}")
+        unet = PeftModel.from_pretrained(unet, unet_lora_path)
+        
+        # Unfreeze for continued training
+        for param in unet.parameters():
+            param.requires_grad = True
+        unet.print_trainable_parameters()
+        print("   ✅ UNet loaded with Stage 1 LoRA (TRAINABLE)")
+    elif use_lora:
         if custom_diffusion_lora:
             print(f"   🔧 Applying Custom Diffusion LoRA (attn2.to_k, attn2.to_v) with rank={lora_rank}")
-            target_modules = ["attn2.to_k", "attn2.to_v"]  # Cross-attention only
+            target_modules = ["attn2.to_k", "attn2.to_v"]
         else:
-            print(f"   🔧 Applying LoRA with rank={lora_rank}")
-            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]  # All attention layers
+            print(f"   🔧 Applying fresh LoRA with rank={lora_rank}")
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
         
         lora_config = LoraConfig(
             r=lora_rank,
-            lora_alpha=lora_rank,  # Typically same as rank
+            lora_alpha=lora_rank,
             init_lora_weights="gaussian",
             target_modules=target_modules,
         )
         unet = get_peft_model(unet, lora_config)
         unet.print_trainable_parameters()
-        if custom_diffusion_lora:
-            print("   ✅ UNet loaded with Custom Diffusion LoRA (cross-attention K,V only)")
-        else:
-            print("   ✅ UNet loaded with LoRA (memory-efficient training)")
+        print("   ✅ UNet loaded with fresh LoRA")
     else:
-        unet.to(device)  # Keep in float32 for training stability
+        unet.to(device)
         print("   ✅ UNet loaded (full fine-tuning)")
     
-    # ControlNet (FROZEN - only provides structural conditioning)
+    # ControlNet (TRAINABLE in Stage 2!)
     controlnet = ControlNetModel.from_pretrained(controlnet_model)
-    controlnet.requires_grad_(False)
-    controlnet.to(device, dtype=weight_dtype)
-    print(f"   ✅ ControlNet loaded from {controlnet_model} (FROZEN)")
+    
+    if train_controlnet:
+        # Keep ControlNet trainable  
+        controlnet.requires_grad_(True)
+        print(f"   ✅ ControlNet loaded from {controlnet_model} (TRAINABLE)")
+        
+        # Count trainable params
+        controlnet_params = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
+        print(f"   📊 ControlNet trainable parameters: {controlnet_params:,}")
+    else:
+        controlnet.requires_grad_(False)
+        controlnet.to(device, dtype=weight_dtype)
+        print(f"   ✅ ControlNet loaded from {controlnet_model} (frozen)")
     
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model, subfolder="scheduler")
@@ -655,8 +588,9 @@ def train(
     
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        print("   ✅ UNet gradient checkpointing enabled")
-    
+        if train_controlnet:
+            controlnet.enable_gradient_checkpointing()
+        print("   ✅ Gradient checkpointing enabled")
     
     # =========================================
     # Dataset
@@ -672,7 +606,7 @@ def train(
     class_images_dir = data_path / "class_images" if with_prior_preservation else None
     class_conditioning_dir = str(data_path / "class_conditioning") if with_prior_preservation else None
     
-    dataset = DreamBoothControlNetDataset(
+    dataset = Stage2Dataset(
         instance_images_dir=str(data_path / "instance_images"),
         conditioning_dir=str(data_path / "conditioning"),
         instance_prompt=instance_prompt,
@@ -699,11 +633,11 @@ def train(
     print(f"   ✅ Dataloader created: {len(dataloader)} batches")
     
     # =========================================
-    # Optimizer (for UNet only)
+    # Optimizer (for UNet, Text Encoder, and ControlNet)
     # =========================================
     print()
     print("=" * 60)
-    print("Phase 4: Setting up optimizer (for UNet)")
+    print("Phase 4: Setting up optimizer")
     print("=" * 60)
     
     if use_8bit_adam:
@@ -717,23 +651,32 @@ def train(
     else:
         optimizer_class = torch.optim.AdamW
     
-    # Get trainable parameters (LoRA only trains a subset)
-    if use_lora:
-        trainable_params = [p for p in unet.parameters() if p.requires_grad]
-        if train_text_encoder:
-            trainable_params += [p for p in text_encoder.parameters() if p.requires_grad]
-        # LoRA typically uses higher learning rate
-        lora_lr = learning_rate if learning_rate >= 1e-4 else 1e-4
-        print(f"   📊 Training {sum(p.numel() for p in trainable_params):,} LoRA parameters (lr={lora_lr})")
-    else:
-        trainable_params = list(unet.parameters())
-        if train_text_encoder:
-            trainable_params += list(text_encoder.parameters())
-        lora_lr = learning_rate
+    # Collect trainable parameters with different learning rates
+    param_groups = []
+    
+    # UNet parameters
+    unet_params = [p for p in unet.parameters() if p.requires_grad]
+    if unet_params:
+        unet_lr = learning_rate if learning_rate >= 1e-4 else 1e-4
+        param_groups.append({"params": unet_params, "lr": unet_lr})
+        print(f"   📊 UNet: {sum(p.numel() for p in unet_params):,} params (lr={unet_lr})")
+    
+    # Text encoder parameters
+    if train_text_encoder:
+        text_params = [p for p in text_encoder.parameters() if p.requires_grad]
+        if text_params:
+            param_groups.append({"params": text_params, "lr": learning_rate})
+            print(f"   📊 Text Encoder: {sum(p.numel() for p in text_params):,} params (lr={learning_rate})")
+    
+    # ControlNet parameters (with separate learning rate)
+    if train_controlnet:
+        controlnet_params = [p for p in controlnet.parameters() if p.requires_grad]
+        if controlnet_params:
+            param_groups.append({"params": controlnet_params, "lr": controlnet_learning_rate})
+            print(f"   📊 ControlNet: {sum(p.numel() for p in controlnet_params):,} params (lr={controlnet_learning_rate})")
     
     optimizer = optimizer_class(
-        trainable_params,
-        lr=lora_lr,
+        param_groups,
         betas=(0.9, 0.999),
         weight_decay=0.01,
         eps=1e-8,
@@ -748,20 +691,31 @@ def train(
     print("   ✅ Optimizer and LR scheduler ready")
     
     # Prepare for distributed training
+    models_to_prepare = [unet, optimizer, dataloader, lr_scheduler]
     if train_text_encoder:
-        unet, text_encoder, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, dataloader, lr_scheduler
-        )
-    else:
-        unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, dataloader, lr_scheduler
-        )
+        models_to_prepare.insert(1, text_encoder)
+    if train_controlnet:
+        models_to_prepare.insert(1, controlnet)
+    
+    prepared = accelerator.prepare(*models_to_prepare)
+    
+    # Unpack prepared models
+    idx = 0
+    unet = prepared[idx]; idx += 1
+    if train_controlnet:
+        controlnet = prepared[idx]; idx += 1
+    if train_text_encoder:
+        text_encoder = prepared[idx]; idx += 1
+    optimizer = prepared[idx]; idx += 1
+    dataloader = prepared[idx]; idx += 1
+    lr_scheduler = prepared[idx]
     
     # Move frozen models to device
     vae.to(accelerator.device, dtype=weight_dtype)
     if not train_text_encoder:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-    controlnet.to(accelerator.device, dtype=weight_dtype)
+    if not train_controlnet:
+        controlnet.to(accelerator.device, dtype=weight_dtype)
     
     print(f"   ✅ Models prepared for distributed training on {accelerator.num_processes} GPU(s)")
     
@@ -770,23 +724,24 @@ def train(
     # =========================================
     print()
     print("=" * 60)
-    print("🚀 Phase 5: Starting Training (UNet)")
+    print("🚀 Phase 5: Starting Training (Stage 2 - Pose Control)")
     print("=" * 60)
-    print(f"  Training: UNet (identity learning)")
-    print(f"  Frozen: ControlNet, VAE, Text Encoder")
-    print(f"  Prior preservation: {with_prior_preservation}")
+    print(f"  Training: UNet + ControlNet" + (" + Text Encoder" if train_text_encoder else ""))
+    print(f"  Frozen: VAE")
     print()
     
     global_step = 0
-    progress_bar = tqdm(range(max_train_steps), desc="Training UNet")
+    progress_bar = tqdm(range(max_train_steps), desc="Stage 2 Training")
     
     unet.train()
-    controlnet.eval()  # ControlNet stays in eval mode
+    if train_controlnet:
+        controlnet.train()
+    if train_text_encoder:
+        text_encoder.train()
     
     while global_step < max_train_steps:
         for batch in dataloader:
             with accelerator.accumulate(unet):
-                # Data is already on device from accelerator
                 pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
                 conditioning_pixel_values = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
                 input_ids = batch["input_ids"]
@@ -810,20 +765,18 @@ def train(
                 # Get text embeddings
                 encoder_hidden_states = text_encoder(input_ids)[0]
                 
-                # Get ControlNet output (frozen, no gradients)
-                # Cast to weight_dtype since ControlNet is in fp16
-                with torch.no_grad():
-                    down_block_res_samples, mid_block_res_sample = controlnet(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states=encoder_hidden_states.to(dtype=weight_dtype),
-                        controlnet_cond=conditioning_pixel_values,
-                        return_dict=False,
-                    )
+                # Get ControlNet output (TRAINABLE in Stage 2!)
+                down_block_res_samples, mid_block_res_sample = controlnet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states.to(dtype=weight_dtype),
+                    controlnet_cond=conditioning_pixel_values,
+                    return_dict=False,
+                )
                 
-                # Predict noise with UNet (TRAINABLE) using ControlNet guidance
+                # Predict noise with UNet using ControlNet guidance
                 model_pred = unet(
-                    noisy_latents.float(),  # UNet in float32 for training
+                    noisy_latents.float(),
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states.float(),
                     down_block_additional_residuals=[s.float() for s in down_block_res_samples],
@@ -838,7 +791,7 @@ def train(
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 
-                # Calculate loss with prior preservation
+                # Calculate loss
                 if with_prior_preservation:
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
@@ -850,17 +803,19 @@ def train(
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
-                # Backward with accelerator
                 accelerator.backward(loss)
                 
-                # Update weights (accelerator handles gradient sync)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                    params_to_clip = list(unet.parameters())
+                    if train_text_encoder:
+                        params_to_clip += list(text_encoder.parameters())
+                    if train_controlnet:
+                        params_to_clip += list(controlnet.parameters())
+                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
             
-            # Logging (only update progress on sync)
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
@@ -868,7 +823,6 @@ def train(
                 effective_loss = loss.item()
                 progress_bar.set_postfix(loss=effective_loss)
                 
-                # Periodic logging
                 if global_step % 50 == 0 and accelerator.is_main_process:
                     log_msg = f"\n📊 Step {global_step}/{max_train_steps} | Loss: {effective_loss:.4f}"
                     if with_prior_preservation:
@@ -876,18 +830,29 @@ def train(
                     print(log_msg)
                     print_vram("Training")
                 
-                # Save checkpoint (only on main process)
                 if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
                     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
                     os.makedirs(checkpoint_dir, exist_ok=True)
-                    # Unwrap and save the UNet/LoRA
+                    
+                    # Save UNet
                     unet_to_save = accelerator.unwrap_model(unet)
-                    if use_lora:
+                    if use_lora or stage1_lora_path:
                         unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet_lora"))
-                        print(f"\n💾 LoRA checkpoint saved: {checkpoint_dir}/unet_lora")
+                        print(f"\n💾 UNet LoRA checkpoint saved")
                     else:
                         unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
-                        print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
+                    
+                    # Save ControlNet
+                    if train_controlnet:
+                        controlnet_to_save = accelerator.unwrap_model(controlnet)
+                        controlnet_to_save.save_pretrained(os.path.join(checkpoint_dir, "controlnet"))
+                        print(f"💾 ControlNet checkpoint saved")
+                    
+                    # Save Text Encoder
+                    if train_text_encoder:
+                        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
+                        text_encoder_to_save.save_pretrained(os.path.join(checkpoint_dir, "text_encoder_lora"))
+                        print(f"💾 Text Encoder LoRA checkpoint saved")
             
             if global_step >= max_train_steps:
                 break
@@ -900,92 +865,74 @@ def train(
     if accelerator.is_main_process:
         print()
         print("=" * 60)
-        print("💾 Saving Final Model")
+        print("💾 Saving Final Stage 2 Model")
         print("=" * 60)
         
-        # Unwrap the trained UNet
+        # Save UNet
         unwrapped_unet = accelerator.unwrap_model(unet)
-        
-        if use_lora:
-            # Save LoRA weights (small ~5MB files)
+        if use_lora or stage1_lora_path:
             lora_path = os.path.join(output_dir, "unet_lora")
             unwrapped_unet.save_pretrained(lora_path)
             print(f"✅ UNet LoRA weights saved to: {lora_path}")
-            
-            # Save text encoder LoRA if trained
-            if train_text_encoder:
-                unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
-                text_encoder_lora_path = os.path.join(output_dir, "text_encoder_lora")
-                unwrapped_text_encoder.save_pretrained(text_encoder_lora_path)
-                print(f"✅ Text encoder LoRA weights saved to: {text_encoder_lora_path}")
-            
-            print()
-            print("=" * 60)
-            print("✅ Training Complete!")
-            print("=" * 60)
-            print()
-            print("To use your trained LoRA model:")
-            print("```python")
-            print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
-            print("from peft import PeftModel")
-            print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{pretrained_model}")')
-            print(f'pipe.unet = PeftModel.from_pretrained(pipe.unet, "{lora_path}")')
-            if train_text_encoder:
-                print(f'pipe.text_encoder = PeftModel.from_pretrained(pipe.text_encoder, "{text_encoder_lora_path}")')
-            print(f'pipe.controlnet = ControlNetModel.from_pretrained("{controlnet_model}")')
-            print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
-            print("```")
         else:
-            # Save the full pipeline with trained UNet
-            from diffusers import StableDiffusionControlNetPipeline
-            
-            pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-                pretrained_model,
-                unet=unwrapped_unet,
-                controlnet=controlnet,
-                text_encoder=text_encoder,
-                vae=vae,
-                tokenizer=tokenizer,
-                safety_checker=None,
-            )
-            pipeline.save_pretrained(output_dir)
-            print(f"✅ Full pipeline saved to: {output_dir}")
-            
-            # Also save just the UNet separately for easy loading
-            unwrapped_unet.save_pretrained(os.path.join(output_dir, "unet_trained"))
-            print(f"✅ Trained UNet also saved to: {output_dir}/unet_trained")
-            
-            print()
-            print("=" * 60)
-            print("✅ Training Complete!")
-            print("=" * 60)
-            print()
-            print("To use your trained model:")
-            print("```python")
-            print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
-            print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{output_dir}")')
-            print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
-            print("```")
+            unet_path = os.path.join(output_dir, "unet")
+            unwrapped_unet.save_pretrained(unet_path)
+            print(f"✅ UNet saved to: {unet_path}")
+        
+        # Save ControlNet
+        if train_controlnet:
+            unwrapped_controlnet = accelerator.unwrap_model(controlnet)
+            controlnet_path = os.path.join(output_dir, "controlnet")
+            unwrapped_controlnet.save_pretrained(controlnet_path)
+            print(f"✅ Trained ControlNet saved to: {controlnet_path}")
+        
+        # Save Text Encoder
+        if train_text_encoder:
+            unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+            text_encoder_path = os.path.join(output_dir, "text_encoder_lora")
+            unwrapped_text_encoder.save_pretrained(text_encoder_path)
+            print(f"✅ Text encoder LoRA saved to: {text_encoder_path}")
+        
+        print()
+        print("=" * 60)
+        print("✅ Stage 2 Training Complete!")
+        print("=" * 60)
+        print()
+        print("To use your trained model for inference:")
+        print("```python")
+        print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
+        print("from peft import PeftModel")
+        print()
+        print(f'controlnet = ControlNetModel.from_pretrained("{os.path.join(output_dir, "controlnet")}")')
+        print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{pretrained_model}", controlnet=controlnet)')
+        if use_lora or stage1_lora_path:
+            print(f'pipe.unet = PeftModel.from_pretrained(pipe.unet, "{os.path.join(output_dir, "unet_lora")}")')
+        if train_text_encoder:
+            print(f'pipe.text_encoder = PeftModel.from_pretrained(pipe.text_encoder, "{os.path.join(output_dir, "text_encoder_lora")}")')
+        print(f'image = pipe("{instance_prompt}", image=pose_image).images[0]')
+        print("```")
     
     accelerator.end_training()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DreamBooth + ControlNet (UNet Training Mode) - trains UNet for identity learning"
+        description="Stage 2: Appearance-Disentangled Pose Control (Train ControlNet)"
     )
     
     # Data and output
     parser.add_argument("--data_dir", type=str, default="./data", help="Data directory")
-    parser.add_argument("--output_dir", type=str, default="./output/dreambooth-unet-controlnet")
+    parser.add_argument("--output_dir", type=str, default="./output/stage2-pose")
     parser.add_argument("--pretrained_model", type=str, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument("--controlnet_model", type=str, default="lllyasviel/control_v11p_sd15_openpose",
-                       help="Pretrained ControlNet to use (frozen)")
+                       help="Pretrained ControlNet to start from")
+    parser.add_argument("--stage1_lora_path", type=str, default=None,
+                       help="Path to Stage 1 trained LoRA weights (contains unet_lora/ and text_encoder_lora/)")
     
     # DreamBooth parameters
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks cat",
-                       help="Prompt with rare identifier for the instance")
-    parser.add_argument("--class_prompt", type=str, default="a photo of cat",
+    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person",
+                       help="Prompt with rare identifier (same as Stage 1)")
+    parser.add_argument("--class_prompt", type=str, default="a photo of person",
                        help="General class prompt for prior preservation")
     parser.add_argument("--with_prior_preservation", action="store_true",
                        help="Enable prior preservation loss")
@@ -1000,9 +947,12 @@ def main():
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--learning_rate", type=float, default=5e-6,
-                       help="Learning rate (standard DreamBooth LR for UNet)")
-    parser.add_argument("--max_train_steps", type=int, default=800)
+    parser.add_argument("--learning_rate", type=float, default=1e-5,
+                       help="Learning rate for UNet/Text Encoder")
+    parser.add_argument("--controlnet_learning_rate", type=float, default=1e-5,
+                       help="Learning rate for ControlNet")
+    parser.add_argument("--max_train_steps", type=int, default=600,
+                       help="Max training steps (fewer for Stage 2)")
     parser.add_argument("--checkpointing_steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--repeats", type=int, default=20,
@@ -1013,15 +963,17 @@ def main():
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--no_8bit_adam", action="store_true")
     parser.add_argument("--no_lora", action="store_true",
-                       help="Disable LoRA (full UNet fine-tuning, requires more VRAM)")
+                       help="Disable LoRA for UNet (full fine-tuning)")
     parser.add_argument("--lora_rank", type=int, default=4,
-                       help="LoRA rank (4-8 typical, higher = more params)")
+                       help="LoRA rank")
     parser.add_argument("--custom_diffusion_lora", action="store_true",
-                       help="Use Custom Diffusion LoRA targets (attn2.to_k, attn2.to_v only)")
-    parser.add_argument("--train_text_encoder", action="store_true",
-                       help="Also train text encoder for stronger identity learning")
+                       help="Use Custom Diffusion LoRA targets")
+    parser.add_argument("--no_train_text_encoder", action="store_true",
+                       help="Disable text encoder training")
+    parser.add_argument("--no_train_controlnet", action="store_true",
+                       help="Freeze ControlNet (NOT recommended for Stage 2)")
     parser.add_argument("--augment_prompt_for_resize", action="store_true",
-                       help="Custom Diffusion: append ', very small' or ', zoomed in' to prompts for resized images")
+                       help="Custom Diffusion: augment prompts for resized images")
     
     args = parser.parse_args()
     
@@ -1030,6 +982,7 @@ def main():
         output_dir=args.output_dir,
         pretrained_model=args.pretrained_model,
         controlnet_model=args.controlnet_model,
+        stage1_lora_path=args.stage1_lora_path,
         instance_prompt=args.instance_prompt,
         class_prompt=args.class_prompt,
         with_prior_preservation=args.with_prior_preservation,
@@ -1040,6 +993,7 @@ def main():
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
+        controlnet_learning_rate=args.controlnet_learning_rate,
         max_train_steps=args.max_train_steps,
         checkpointing_steps=args.checkpointing_steps,
         mixed_precision=not args.no_mixed_precision,
@@ -1048,7 +1002,8 @@ def main():
         use_lora=not args.no_lora,
         lora_rank=args.lora_rank,
         custom_diffusion_lora=args.custom_diffusion_lora,
-        train_text_encoder=args.train_text_encoder,
+        train_text_encoder=not args.no_train_text_encoder,
+        train_controlnet=not args.no_train_controlnet,
         augment_prompt_for_resize=args.augment_prompt_for_resize,
         seed=args.seed,
         repeats=args.repeats,

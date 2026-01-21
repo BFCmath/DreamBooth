@@ -1,41 +1,39 @@
 #!/usr/bin/env python3
 """
-Custom Diffusion: Multi-Concept Customization of Text-to-Image Diffusion
+Stage 1: Appearance Control Pretraining (No ControlNet)
 
-DreamBooth + ControlNet Training Script (UNet Training Mode)
+This script trains the UNet + Text Encoder for identity learning WITHOUT ControlNet.
+The model learns to associate the "sks" token with the specific identity appearance
+purely from text embeddings.
 
-This script trains the UNet for identity learning while using a FROZEN pretrained
-ControlNet for structural conditioning. This is the CORRECT approach for 
-identity-oriented fine-tuning with ControlNet.
-
-Key difference from dreambooth_controlnet.py:
-- UNet is TRAINED (identity learning happens here)
-- ControlNet is FROZEN (only provides structural conditioning)
+Key differences from Stage 2:
+- NO ControlNet (not loaded at all)
+- Text Encoder is TRAINED by default (to learn sks token embedding)
+- Task is pure reconstruction: text prompt → image
 
 This approach:
-1. Preserves the base ControlNet's conditioning capabilities
-2. Allows UNet to learn the specific identity (sks token binding)
-3. Uses prior preservation to prevent catastrophic forgetting
+1. Forces the UNet to rely entirely on text embeddings for identity
+2. Trains the "sks" token to encode identity features
+3. Prepares the model for Stage 2 (pose control)
+
+After Stage 1, use Stage 2 to add pose control while preserving identity.
 
 Based on:
+- MagicPose paper: https://arxiv.org/pdf/2311.12052
 - DreamBooth paper: https://arxiv.org/abs/2208.12242
-- ControlNet paper: https://arxiv.org/abs/2302.05543
 
 Dataset Structure Required:
     data/
-    ├── instance_images/      # Instance images (the identity you want to learn)
+    ├── instance_images/      # Instance images (5-7 images of the identity)
     │   ├── 001.png
-    │   └── ...
-    ├── conditioning/         # Conditioning images (pose/edges) for each instance
-    │   ├── 001.png           # Must match instance image names
     │   └── ...
     └── prompts.txt           # Optional: One prompt per line
 
 Key Hyperparameters:
-- instance_prompt: "a photo of sks cat" (sks is the rare token identifier)
-- class_prompt: "a photo of cat" (for prior preservation)
+- instance_prompt: "a photo of sks person" (sks is the rare token identifier)
+- class_prompt: "a photo of person" (for prior preservation)
 - learning_rate: 5e-6 (standard DreamBooth LR)
-- max_train_steps: 400-800 (typical for DreamBooth)
+- max_train_steps: 800-1200 (more steps since no pose guidance)
 """
 
 import argparse
@@ -55,8 +53,7 @@ from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     UNet2DConditionModel,
-    ControlNetModel,
-    StableDiffusionControlNetPipeline,
+    StableDiffusionPipeline,  # Use standard pipeline for class generation (no ControlNet)
 )
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -65,37 +62,33 @@ from accelerate.utils import set_seed
 from peft import LoraConfig, get_peft_model
 
 # Local utilities
-from utils import print_vram, extract_conditioning, collate_fn
+from utils import print_vram
 
 
 # =============================================================================
-# Dataset for DreamBooth + ControlNet
+# Dataset for Stage 1 (No Conditioning Required)
 # =============================================================================
-class DreamBoothControlNetDataset(Dataset):
+class Stage1Dataset(Dataset):
     """
-    Dataset for DreamBooth-style training with ControlNet conditioning.
+    Dataset for Stage 1 appearance pretraining.
     
-    Combines:
-    - Instance images (the specific identity to learn) with conditioning
-    - Class images (for prior preservation) with conditioning
+    Unlike Stage 2, this does NOT require conditioning images since
+    we're training without ControlNet.
     """
     
     def __init__(
         self,
         instance_images_dir: str,
-        conditioning_dir: str,
         instance_prompt: str,
         tokenizer,
         class_images_dir: str = None,
-        class_conditioning_dir: str = None,
         class_prompt: str = None,
         prompts_file: str = None,
         resolution: int = 512,
         repeats: int = 1,
-        augment_prompt_for_resize: bool = False,  # Custom Diffusion: augment prompts for small/cropped images
+        augment_prompt_for_resize: bool = False,
     ):
         self.instance_images_dir = Path(instance_images_dir)
-        self.conditioning_dir = Path(conditioning_dir)
         self.instance_prompt = instance_prompt
         self.tokenizer = tokenizer
         self.resolution = resolution
@@ -122,7 +115,6 @@ class DreamBoothControlNetDataset(Dataset):
         
         # Class images (for prior preservation)
         self.class_images = []
-        self.class_conditioning_dir = None
         self.class_prompt = class_prompt
         
         if class_images_dir and os.path.exists(class_images_dir):
@@ -133,10 +125,6 @@ class DreamBoothControlNetDataset(Dataset):
             ])
             self.num_class_images = len(self.class_images)
             print(f"📊 Found {self.num_class_images} class images for prior preservation")
-            
-            if class_conditioning_dir and os.path.exists(class_conditioning_dir):
-                self.class_conditioning_dir = Path(class_conditioning_dir)
-                print(f"📊 Using class conditioning from {class_conditioning_dir}")
         else:
             self.num_class_images = 0
         
@@ -150,128 +138,48 @@ class DreamBoothControlNetDataset(Dataset):
         # Custom Diffusion random scale range (0.4 to 1.4)
         self.scale_min = 0.4
         self.scale_max = 1.4
-        
-        # Fill color for padding (gray = 128/255 ≈ 0.5)
         self.pad_fill_color = (128, 128, 128)
     
     def __len__(self):
         return self._length
     
-    def _apply_custom_diffusion_augmentation(self, image: Image.Image, cond_image: Image.Image):
-        """
-        Apply Custom Diffusion random scale augmentation to BOTH image and conditioning.
-        
-        From the paper:
-        - Random scale between 0.4 and 1.4
-        - If scale < 1.0: Shrink image, pad with grey → "very small, far away"
-        - If scale > 1.0: Enlarge and center crop → "zoomed in, close up"
-        
-        CRITICAL: Same transform is applied to BOTH image and conditioning!
-        
-        Returns:
-            augmented_image: PIL Image at resolution x resolution
-            augmented_cond: PIL Image at resolution x resolution  
-            scale_factor: The random scale used (for prompt augmentation)
-        """
+    def _apply_custom_diffusion_augmentation(self, image: Image.Image):
+        """Apply Custom Diffusion random scale augmentation."""
         import random
         
-        # Sample random scale factor
         scale_factor = random.uniform(self.scale_min, self.scale_max)
-        
-        # Both images should be resized to same base size first
-        # We'll work at the target resolution
         base_size = self.resolution
         
         if scale_factor < 1.0:
-            # SHRINK: Make object appear smaller/farther
-            # Shrink the image, then pad to fill resolution
             new_size = int(base_size * scale_factor)
-            
-            # Resize both images to smaller size
             resized_image = image.resize((new_size, new_size), Image.BILINEAR)
-            resized_cond = cond_image.resize((new_size, new_size), Image.BILINEAR)
-            
-            # Create padded images with grey background
             padded_image = Image.new("RGB", (base_size, base_size), self.pad_fill_color)
-            padded_cond = Image.new("RGB", (base_size, base_size), self.pad_fill_color)
-            
-            # Center the resized image
             offset = (base_size - new_size) // 2
             padded_image.paste(resized_image, (offset, offset))
-            padded_cond.paste(resized_cond, (offset, offset))
-            
-            return padded_image, padded_cond, scale_factor
-            
+            return padded_image, scale_factor
         else:
-            # ENLARGE & CROP: Make object appear larger/closer (zoomed in)
-            # Enlarge the image, then center crop to resolution
             new_size = int(base_size * scale_factor)
-            
-            # Resize both images to larger size
             resized_image = image.resize((new_size, new_size), Image.BILINEAR)
-            resized_cond = cond_image.resize((new_size, new_size), Image.BILINEAR)
-            
-            # Center crop back to resolution
             offset = (new_size - base_size) // 2
             cropped_image = resized_image.crop((offset, offset, offset + base_size, offset + base_size))
-            cropped_cond = resized_cond.crop((offset, offset, offset + base_size, offset + base_size))
-            
-            return cropped_image, cropped_cond, scale_factor
+            return cropped_image, scale_factor
     
-    def _load_image_and_conditioning(self, image_path, cond_dir, apply_augmentation=True):
-        """
-        Load an image and its corresponding conditioning image.
-        
-        If augment_prompt_for_resize is enabled, applies Custom Diffusion 
-        random scale augmentation to BOTH images with the same transform.
-        
-        Returns:
-            pixel_values: Transformed image tensor
-            conditioning_pixel_values: Transformed conditioning tensor
-            scale_factor: The scale factor used (for prompt augmentation)
-        """
+    def _load_image(self, image_path, apply_augmentation=True):
+        """Load and preprocess an image."""
         image = Image.open(image_path).convert("RGB")
-        
-        # Find conditioning image
-        cond_path = cond_dir / image_path.name
-        if not cond_path.exists():
-            cond_files = list(cond_dir.glob(f"{image_path.stem}.*"))
-            if cond_files:
-                cond_path = cond_files[0]
-            else:
-                raise FileNotFoundError(f"No conditioning image for {image_path.name} in {cond_dir}")
-        
-        cond_image = Image.open(cond_path).convert("RGB")
-        
-        # First, resize both images to the target resolution (base preprocessing)
         image = image.resize((self.resolution, self.resolution), Image.BILINEAR)
-        cond_image = cond_image.resize((self.resolution, self.resolution), Image.BILINEAR)
         
-        # Apply Custom Diffusion augmentation if enabled
-        scale_factor = 1.0  # No augmentation by default
+        scale_factor = 1.0
         if self.augment_prompt_for_resize and apply_augmentation:
-            image, cond_image, scale_factor = self._apply_custom_diffusion_augmentation(
-                image, cond_image
-            )
+            image, scale_factor = self._apply_custom_diffusion_augmentation(image)
         
-        # Convert to tensors
-        # Image: normalize to [-1, 1] for diffusion model
         image_tensor = transforms.ToTensor()(image)
         pixel_values = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])(image_tensor)
         
-        # Conditioning: just [0, 1] range
-        conditioning_pixel_values = transforms.ToTensor()(cond_image)
-        
-        return pixel_values, conditioning_pixel_values, scale_factor
+        return pixel_values, scale_factor
     
     def _get_prompt_suffix(self, scale_factor: float) -> str:
-        """
-        Get prompt suffix based on scale factor (Custom Diffusion technique).
-        
-        - scale < 1.0: Object is shrunk → ", very small, far away"
-        - scale > 1.0: Object is zoomed → ", zoomed in, close up"
-        - scale ≈ 1.0: No suffix
-        """
+        """Get prompt suffix based on scale factor."""
         if scale_factor < 0.9:
             return ", very small, far away"
         elif scale_factor > 1.1:
@@ -285,12 +193,8 @@ class DreamBoothControlNetDataset(Dataset):
         instance_idx = idx % self.num_instance_images
         instance_path = self.instance_images[instance_idx]
         
-        pixel_values, conditioning_pixel_values, scale_factor = self._load_image_and_conditioning(
-            instance_path, self.conditioning_dir, apply_augmentation=True
-        )
-        
+        pixel_values, scale_factor = self._load_image(instance_path, apply_augmentation=True)
         example["instance_pixel_values"] = pixel_values
-        example["instance_conditioning"] = conditioning_pixel_values
         
         # Get prompt
         if self.prompts is not None and instance_idx < len(self.prompts):
@@ -298,7 +202,7 @@ class DreamBoothControlNetDataset(Dataset):
         else:
             prompt = self.instance_prompt
         
-        # Apply Custom Diffusion prompt augmentation based on scale factor
+        # Apply Custom Diffusion prompt augmentation
         if self.augment_prompt_for_resize:
             suffix = self._get_prompt_suffix(scale_factor)
             if suffix:
@@ -313,22 +217,12 @@ class DreamBoothControlNetDataset(Dataset):
         ).input_ids.squeeze(0)
         
         # Class image (for prior preservation)
-        # Note: Class images don't get augmentation to maintain stable regularization
         if self.num_class_images > 0:
             class_idx = idx % self.num_class_images
             class_path = self.class_images[class_idx]
             
-            if self.class_conditioning_dir is None:
-                raise ValueError(
-                    "Prior preservation requires class_conditioning_dir! "
-                    "Run training with --with_prior_preservation to auto-generate class images + conditioning."
-                )
-            
-            class_pixels, class_cond, _ = self._load_image_and_conditioning(
-                class_path, self.class_conditioning_dir, apply_augmentation=False
-            )
+            class_pixels, _ = self._load_image(class_path, apply_augmentation=False)
             example["class_pixel_values"] = class_pixels
-            example["class_conditioning"] = class_cond
             
             example["class_prompt_ids"] = self.tokenizer(
                 self.class_prompt,
@@ -341,174 +235,133 @@ class DreamBoothControlNetDataset(Dataset):
         return example
 
 
+def collate_fn_stage1(examples, with_prior_preservation=False):
+    """Collate function for Stage 1 (no conditioning)."""
+    pixel_values = torch.stack([e["instance_pixel_values"] for e in examples])
+    input_ids = torch.stack([e["instance_prompt_ids"] for e in examples])
+    
+    if with_prior_preservation and "class_pixel_values" in examples[0]:
+        class_pixel_values = torch.stack([e["class_pixel_values"] for e in examples])
+        class_input_ids = torch.stack([e["class_prompt_ids"] for e in examples])
+        
+        pixel_values = torch.cat([pixel_values, class_pixel_values], dim=0)
+        input_ids = torch.cat([input_ids, class_input_ids], dim=0)
+    
+    return {
+        "pixel_values": pixel_values,
+        "input_ids": input_ids,
+    }
+
+
 # =============================================================================
-# Class Image Generation (for Prior Preservation)
+# Class Image Generation (for Prior Preservation) - NO ControlNet
 # =============================================================================
-def generate_class_images(
+def generate_class_images_stage1(
     class_images_dir: str,
-    class_conditioning_dir: str,
-    instance_conditioning_dir: str,  # NEW: Use instance conditioning for class generation
     class_prompt: str,
     num_class_images: int,
     pretrained_model: str,
-    controlnet_path: str,  # REQUIRED: Need ControlNet for conditioned generation
     device: str = "cuda",
-    sample_batch_size: int = 1,  # Lower default for ControlNet pipeline
 ):
     """
-    Generate class images using the SAME conditioning as instance images.
+    Generate class images using standard Stable Diffusion (no ControlNet).
     
-    This is crucial for proper DreamBooth + ControlNet training:
-    - Instance: (instance_image, pose_i, "sks cat") 
-    - Class:   (class_image, pose_i, "cat")  <- SAME pose!
-    
-    The prior preservation loss then teaches:
-    - "sks" modifier means this specific identity
-    - Pose control is preserved because both use the same conditioning
+    For Stage 1 prior preservation, we just need generic class images.
     """
-    import shutil
-    
     class_dir = Path(class_images_dir)
     class_dir.mkdir(parents=True, exist_ok=True)
     
-    cond_dir = Path(class_conditioning_dir)
-    cond_dir.mkdir(parents=True, exist_ok=True)
-    
-    instance_cond_dir = Path(instance_conditioning_dir)
-    
-    # Count existing images
     existing_images = list(class_dir.glob("*.png")) + list(class_dir.glob("*.jpg"))
     cur_class_images = len(existing_images)
     
     if cur_class_images >= num_class_images:
-        existing_cond = list(cond_dir.glob("*.png")) + list(cond_dir.glob("*.jpg"))
-        if len(existing_cond) >= num_class_images:
-            print(f"✅ Found {cur_class_images} class images + {len(existing_cond)} conditioning (needed {num_class_images})")
-            return
-    
-    # Load instance conditioning images
-    instance_cond_files = sorted([
-        f for f in instance_cond_dir.iterdir()
-        if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']
-    ])
-    
-    if len(instance_cond_files) == 0:
-        raise ValueError(f"No conditioning images found in {instance_conditioning_dir}")
+        print(f"✅ Found {cur_class_images} class images (needed {num_class_images})")
+        return
     
     num_to_generate = num_class_images - cur_class_images
     print(f"📸 Generating {num_to_generate} class images with prompt: '{class_prompt}'")
-    print(f"   🎯 Using instance conditioning for proper prior preservation!")
-    print(f"   📂 Instance conditioning dir: {instance_conditioning_dir}")
-    print(f"   📂 ControlNet: {controlnet_path}")
     
-    # Load ControlNet pipeline for conditioned generation
-    controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch.float16)
-    
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+    # Use standard SD pipeline (no ControlNet)
+    pipeline = StableDiffusionPipeline.from_pretrained(
         pretrained_model,
-        controlnet=controlnet,
         torch_dtype=torch.float16,
         safety_checker=None,
     )
     pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     
-    generated = 0
-    
-    for idx in tqdm(range(num_to_generate), desc="Generating class images with instance conditioning"):
-        # Cycle through instance conditioning images
-        cond_idx = (cur_class_images + idx) % len(instance_cond_files)
-        cond_file = instance_cond_files[cond_idx]
-        
-        # Load conditioning image
-        cond_image = Image.open(cond_file).convert("RGB")
-        
-        # Generate class image using the SAME conditioning as instance
+    for idx in tqdm(range(num_to_generate), desc="Generating class images"):
         image = pipeline(
             prompt=class_prompt,
-            image=cond_image,
             num_inference_steps=25,
             guidance_scale=7.5,
         ).images[0]
         
-        # Save class image
-        class_image_idx = cur_class_images + idx
-        image_path = class_dir / f"class_{class_image_idx:04d}.png"
+        image_path = class_dir / f"class_{cur_class_images + idx:04d}.png"
         image.save(image_path)
-        
-        # Copy/save the conditioning (same as instance conditioning)
-        cond_path = cond_dir / f"class_{class_image_idx:04d}.png"
-        cond_image.save(cond_path)  # Save the conditioning we used
-        
-        generated += 1
     
     del pipeline
-    del controlnet
     torch.cuda.empty_cache()
     gc.collect()
     
-    print(f"✅ Generated {num_to_generate} class images using instance conditioning")
+    print(f"✅ Generated {num_to_generate} class images")
 
 
 # =============================================================================
-# Training Function - TRAINS UNET (not ControlNet)
+# Training Function - Stage 1: Appearance Pretraining (NO ControlNet)
 # =============================================================================
 def train(
     data_dir: str = "./data",
-    output_dir: str = "./output/dreambooth-unet-controlnet",
+    output_dir: str = "./output/stage1-appearance",
     pretrained_model: str = "runwayml/stable-diffusion-v1-5",
-    controlnet_model: str = "lllyasviel/control_v11p_sd15_canny",
     # DreamBooth-specific parameters
-    instance_prompt: str = "a photo of sks cat",
-    class_prompt: str = "a photo of cat",
+    instance_prompt: str = "a photo of sks person",
+    class_prompt: str = "a photo of person",
     with_prior_preservation: bool = True,
     prior_loss_weight: float = 1.0,
     num_class_images: int = 100,
-    sample_batch_size: int = 4,
     # Training parameters
     resolution: int = 512,
     train_batch_size: int = 1,
     gradient_accumulation_steps: int = 4,
-    learning_rate: float = 5e-6,  # Standard DreamBooth LR for UNet
-    max_train_steps: int = 800,
+    learning_rate: float = 5e-6,
+    max_train_steps: int = 1000,  # More steps for Stage 1 (no pose guidance)
     checkpointing_steps: int = 200,
     mixed_precision: bool = True,
     gradient_checkpointing: bool = True,
     use_8bit_adam: bool = True,
-    use_lora: bool = True,  # Use LoRA for memory-efficient training
-    lora_rank: int = 4,  # LoRA rank (4-8 typical for DreamBooth)
-    custom_diffusion_lora: bool = False,  # Custom Diffusion: only target attn2.to_k, attn2.to_v
-    train_text_encoder: bool = False,  # Also train text encoder for stronger identity
-    augment_prompt_for_resize: bool = False,  # Custom Diffusion: augment prompts for resized images
+    use_lora: bool = True,
+    lora_rank: int = 4,
+    custom_diffusion_lora: bool = False,
+    train_text_encoder: bool = True,  # ENABLED by default for Stage 1
+    augment_prompt_for_resize: bool = False,
     seed: int = 42,
     repeats: int = 20,
 ):
     """
-    Train UNet with DreamBooth technique using frozen ControlNet for conditioning.
+    Stage 1: Appearance Control Pretraining
     
-    This is the CORRECT approach for identity-oriented fine-tuning:
-    - UNet learns the identity (sks token binding)
-    - ControlNet provides structural conditioning (frozen)
+    Train UNet + Text Encoder WITHOUT ControlNet.
+    The model learns to associate "sks" with identity from text alone.
     """
     
     print("=" * 60)
-    print("DreamBooth + ControlNet (UNet Training Mode)")
+    print("🎨 Stage 1: Appearance Control Pretraining")
     print("=" * 60)
     print()
-    print("🔑 KEY DIFFERENCE: This trains UNET for identity learning!")
-    print("   ControlNet is FROZEN (only provides structural guidance)")
+    print("🔑 KEY: NO ControlNet - pure text-to-image identity learning!")
+    print("   Text Encoder: TRAINED (learning sks token)")
+    print("   UNet: TRAINED (learning identity features)")
     print()
     print(f"Data directory: {data_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Base model: {pretrained_model}")
-    print(f"ControlNet: {controlnet_model}")
     print()
     print("DreamBooth Configuration:")
     print(f"  Instance prompt: {instance_prompt}")
     print(f"  Class prompt: {class_prompt}")
     print(f"  Prior preservation: {with_prior_preservation}")
-    print(f"  Prior loss weight: {prior_loss_weight}")
-    print(f"  Num class images: {num_class_images}")
+    print(f"  Train text encoder: {train_text_encoder}")
     print()
     print("Training Configuration:")
     print(f"  Resolution: {resolution}")
@@ -520,13 +373,12 @@ def train(
     print("=" * 60)
     print()
     
-    # Setup Accelerator for multi-GPU training
+    # Setup Accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision="fp16" if mixed_precision else "no",
     )
     
-    # Only create output dir on main process
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
     
@@ -545,59 +397,49 @@ def train(
     # Generate Class Images (if needed)
     # =========================================
     if with_prior_preservation:
-        # Only generate class images on main process
         if accelerator.is_main_process:
             print("=" * 60)
             print("Phase 1: Generating class images for prior preservation")
             print("=" * 60)
             
             class_images_dir = data_path / "class_images"
-            class_conditioning_dir = data_path / "class_conditioning"
-            instance_conditioning_dir = data_path / "conditioning"
             
-            generate_class_images(
+            generate_class_images_stage1(
                 class_images_dir=str(class_images_dir),
-                class_conditioning_dir=str(class_conditioning_dir),
-                instance_conditioning_dir=str(instance_conditioning_dir),
                 class_prompt=class_prompt,
                 num_class_images=num_class_images,
                 pretrained_model=pretrained_model,
-                controlnet_path=controlnet_model,
-                device="cuda",  # Use cuda directly for class generation
-                sample_batch_size=sample_batch_size,
+                device="cuda",
             )
-        # Wait for class images to be generated before all processes continue
         accelerator.wait_for_everyone()
         print()
     
     # =========================================
-    # Load Models
+    # Load Models (NO ControlNet!)
     # =========================================
     print("=" * 60)
-    print("Phase 2: Loading models")
+    print("Phase 2: Loading models (NO ControlNet)")
     print("=" * 60)
     
     # Tokenizer
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model, subfolder="tokenizer")
     print("   ✅ Tokenizer loaded")
     
-    # Text encoder
+    # Text encoder (TRAINABLE for Stage 1)
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model, subfolder="text_encoder")
     
-    # Apply LoRA to text encoder if train_text_encoder is enabled
     if train_text_encoder and use_lora:
         print(f"   🔧 Applying LoRA to text encoder with rank={lora_rank}")
         text_encoder_lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_rank,
             init_lora_weights="gaussian",
-            target_modules=["q_proj", "v_proj"],  # Attention layers in CLIP
+            target_modules=["q_proj", "v_proj"],
         )
         text_encoder = get_peft_model(text_encoder, text_encoder_lora_config)
         text_encoder.print_trainable_parameters()
         print("   ✅ Text encoder loaded with LoRA (TRAINABLE)")
     elif train_text_encoder:
-        # Full fine-tuning of text encoder
         text_encoder.to(device)
         print("   ✅ Text encoder loaded (TRAINABLE - full fine-tuning)")
     else:
@@ -611,41 +453,32 @@ def train(
     vae.to(device, dtype=weight_dtype)
     print("   ✅ VAE loaded (frozen)")
     
-    # UNet (TRAINABLE - this is where identity learning happens!)
+    # UNet (TRAINABLE)
     unet = UNet2DConditionModel.from_pretrained(pretrained_model, subfolder="unet")
     
-    # Apply LoRA for memory-efficient training
     if use_lora:
-        # Custom Diffusion paper: only train cross-attention K and V projections
-        # This is more parameter-efficient and works well for concept learning
         if custom_diffusion_lora:
             print(f"   🔧 Applying Custom Diffusion LoRA (attn2.to_k, attn2.to_v) with rank={lora_rank}")
-            target_modules = ["attn2.to_k", "attn2.to_v"]  # Cross-attention only
+            target_modules = ["attn2.to_k", "attn2.to_v"]
         else:
             print(f"   🔧 Applying LoRA with rank={lora_rank}")
-            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]  # All attention layers
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
         
         lora_config = LoraConfig(
             r=lora_rank,
-            lora_alpha=lora_rank,  # Typically same as rank
+            lora_alpha=lora_rank,
             init_lora_weights="gaussian",
             target_modules=target_modules,
         )
         unet = get_peft_model(unet, lora_config)
         unet.print_trainable_parameters()
-        if custom_diffusion_lora:
-            print("   ✅ UNet loaded with Custom Diffusion LoRA (cross-attention K,V only)")
-        else:
-            print("   ✅ UNet loaded with LoRA (memory-efficient training)")
+        print("   ✅ UNet loaded with LoRA")
     else:
-        unet.to(device)  # Keep in float32 for training stability
+        unet.to(device)
         print("   ✅ UNet loaded (full fine-tuning)")
     
-    # ControlNet (FROZEN - only provides structural conditioning)
-    controlnet = ControlNetModel.from_pretrained(controlnet_model)
-    controlnet.requires_grad_(False)
-    controlnet.to(device, dtype=weight_dtype)
-    print(f"   ✅ ControlNet loaded from {controlnet_model} (FROZEN)")
+    # NO ControlNet in Stage 1!
+    print("   ⏭️  ControlNet: SKIPPED (Stage 1 - no structural conditioning)")
     
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model, subfolder="scheduler")
@@ -655,8 +488,9 @@ def train(
     
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        print("   ✅ UNet gradient checkpointing enabled")
-    
+        if train_text_encoder and hasattr(text_encoder, 'gradient_checkpointing_enable'):
+            text_encoder.gradient_checkpointing_enable()
+        print("   ✅ Gradient checkpointing enabled")
     
     # =========================================
     # Dataset
@@ -670,15 +504,12 @@ def train(
     prompts_file = str(prompts_file) if prompts_file.exists() else None
     
     class_images_dir = data_path / "class_images" if with_prior_preservation else None
-    class_conditioning_dir = str(data_path / "class_conditioning") if with_prior_preservation else None
     
-    dataset = DreamBoothControlNetDataset(
+    dataset = Stage1Dataset(
         instance_images_dir=str(data_path / "instance_images"),
-        conditioning_dir=str(data_path / "conditioning"),
         instance_prompt=instance_prompt,
         tokenizer=tokenizer,
         class_images_dir=str(class_images_dir) if class_images_dir else None,
-        class_conditioning_dir=class_conditioning_dir,
         class_prompt=class_prompt if with_prior_preservation else None,
         prompts_file=prompts_file,
         resolution=resolution,
@@ -687,7 +518,7 @@ def train(
     )
     
     def collate_fn_wrapper(examples):
-        return collate_fn(examples, with_prior_preservation=with_prior_preservation)
+        return collate_fn_stage1(examples, with_prior_preservation=with_prior_preservation)
     
     dataloader = DataLoader(
         dataset,
@@ -699,11 +530,11 @@ def train(
     print(f"   ✅ Dataloader created: {len(dataloader)} batches")
     
     # =========================================
-    # Optimizer (for UNet only)
+    # Optimizer (for UNet + Text Encoder)
     # =========================================
     print()
     print("=" * 60)
-    print("Phase 4: Setting up optimizer (for UNet)")
+    print("Phase 4: Setting up optimizer")
     print("=" * 60)
     
     if use_8bit_adam:
@@ -717,18 +548,17 @@ def train(
     else:
         optimizer_class = torch.optim.AdamW
     
-    # Get trainable parameters (LoRA only trains a subset)
+    # Get trainable parameters
     if use_lora:
         trainable_params = [p for p in unet.parameters() if p.requires_grad]
         if train_text_encoder:
             trainable_params += [p for p in text_encoder.parameters() if p.requires_grad]
-        # LoRA typically uses higher learning rate
         lora_lr = learning_rate if learning_rate >= 1e-4 else 1e-4
         print(f"   📊 Training {sum(p.numel() for p in trainable_params):,} LoRA parameters (lr={lora_lr})")
     else:
-        trainable_params = list(unet.parameters())
+        trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
         if train_text_encoder:
-            trainable_params += list(text_encoder.parameters())
+            trainable_params += list(filter(lambda p: p.requires_grad, text_encoder.parameters()))
         lora_lr = learning_rate
     
     optimizer = optimizer_class(
@@ -761,34 +591,32 @@ def train(
     vae.to(accelerator.device, dtype=weight_dtype)
     if not train_text_encoder:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-    controlnet.to(accelerator.device, dtype=weight_dtype)
     
     print(f"   ✅ Models prepared for distributed training on {accelerator.num_processes} GPU(s)")
     
     # =========================================
-    # Training Loop
+    # Training Loop (NO ControlNet!)
     # =========================================
     print()
     print("=" * 60)
-    print("🚀 Phase 5: Starting Training (UNet)")
+    print("🚀 Phase 5: Starting Training (Stage 1 - No ControlNet)")
     print("=" * 60)
-    print(f"  Training: UNet (identity learning)")
-    print(f"  Frozen: ControlNet, VAE, Text Encoder")
-    print(f"  Prior preservation: {with_prior_preservation}")
+    print(f"  Training: UNet + Text Encoder")
+    print(f"  Frozen: VAE")
+    print(f"  Disabled: ControlNet (Stage 1)")
     print()
     
     global_step = 0
-    progress_bar = tqdm(range(max_train_steps), desc="Training UNet")
+    progress_bar = tqdm(range(max_train_steps), desc="Stage 1 Training")
     
     unet.train()
-    controlnet.eval()  # ControlNet stays in eval mode
+    if train_text_encoder:
+        text_encoder.train()
     
     while global_step < max_train_steps:
         for batch in dataloader:
             with accelerator.accumulate(unet):
-                # Data is already on device from accelerator
                 pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
-                conditioning_pixel_values = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
                 input_ids = batch["input_ids"]
                 
                 # Encode images to latent space
@@ -810,24 +638,13 @@ def train(
                 # Get text embeddings
                 encoder_hidden_states = text_encoder(input_ids)[0]
                 
-                # Get ControlNet output (frozen, no gradients)
-                # Cast to weight_dtype since ControlNet is in fp16
-                with torch.no_grad():
-                    down_block_res_samples, mid_block_res_sample = controlnet(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states=encoder_hidden_states.to(dtype=weight_dtype),
-                        controlnet_cond=conditioning_pixel_values,
-                        return_dict=False,
-                    )
-                
-                # Predict noise with UNet (TRAINABLE) using ControlNet guidance
+                # Predict noise with UNet (NO ControlNet residuals!)
                 model_pred = unet(
-                    noisy_latents.float(),  # UNet in float32 for training
+                    noisy_latents.float(),
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states.float(),
-                    down_block_additional_residuals=[s.float() for s in down_block_res_samples],
-                    mid_block_additional_residual=mid_block_res_sample.float(),
+                    # NO down_block_additional_residuals
+                    # NO mid_block_additional_residual
                 ).sample
                 
                 # Get target
@@ -838,7 +655,7 @@ def train(
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 
-                # Calculate loss with prior preservation
+                # Calculate loss
                 if with_prior_preservation:
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
@@ -850,17 +667,17 @@ def train(
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
-                # Backward with accelerator
                 accelerator.backward(loss)
                 
-                # Update weights (accelerator handles gradient sync)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                    params_to_clip = list(unet.parameters())
+                    if train_text_encoder:
+                        params_to_clip += list(text_encoder.parameters())
+                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
             
-            # Logging (only update progress on sync)
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
@@ -868,7 +685,6 @@ def train(
                 effective_loss = loss.item()
                 progress_bar.set_postfix(loss=effective_loss)
                 
-                # Periodic logging
                 if global_step % 50 == 0 and accelerator.is_main_process:
                     log_msg = f"\n📊 Step {global_step}/{max_train_steps} | Loss: {effective_loss:.4f}"
                     if with_prior_preservation:
@@ -876,18 +692,22 @@ def train(
                     print(log_msg)
                     print_vram("Training")
                 
-                # Save checkpoint (only on main process)
                 if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
                     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
                     os.makedirs(checkpoint_dir, exist_ok=True)
-                    # Unwrap and save the UNet/LoRA
+                    
                     unet_to_save = accelerator.unwrap_model(unet)
                     if use_lora:
                         unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet_lora"))
-                        print(f"\n💾 LoRA checkpoint saved: {checkpoint_dir}/unet_lora")
+                        print(f"\n💾 UNet LoRA checkpoint saved: {checkpoint_dir}/unet_lora")
                     else:
                         unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
-                        print(f"\n💾 UNet checkpoint saved: {checkpoint_dir}")
+                    
+                    if train_text_encoder:
+                        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
+                        if use_lora:
+                            text_encoder_to_save.save_pretrained(os.path.join(checkpoint_dir, "text_encoder_lora"))
+                            print(f"💾 Text Encoder LoRA checkpoint saved: {checkpoint_dir}/text_encoder_lora")
             
             if global_step >= max_train_steps:
                 break
@@ -900,19 +720,16 @@ def train(
     if accelerator.is_main_process:
         print()
         print("=" * 60)
-        print("💾 Saving Final Model")
+        print("💾 Saving Final Stage 1 Model")
         print("=" * 60)
         
-        # Unwrap the trained UNet
         unwrapped_unet = accelerator.unwrap_model(unet)
         
         if use_lora:
-            # Save LoRA weights (small ~5MB files)
             lora_path = os.path.join(output_dir, "unet_lora")
             unwrapped_unet.save_pretrained(lora_path)
             print(f"✅ UNet LoRA weights saved to: {lora_path}")
             
-            # Save text encoder LoRA if trained
             if train_text_encoder:
                 unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
                 text_encoder_lora_path = os.path.join(output_dir, "text_encoder_lora")
@@ -921,71 +738,39 @@ def train(
             
             print()
             print("=" * 60)
-            print("✅ Training Complete!")
+            print("✅ Stage 1 Training Complete!")
             print("=" * 60)
             print()
-            print("To use your trained LoRA model:")
-            print("```python")
-            print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
-            print("from peft import PeftModel")
-            print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{pretrained_model}")')
-            print(f'pipe.unet = PeftModel.from_pretrained(pipe.unet, "{lora_path}")')
-            if train_text_encoder:
-                print(f'pipe.text_encoder = PeftModel.from_pretrained(pipe.text_encoder, "{text_encoder_lora_path}")')
-            print(f'pipe.controlnet = ControlNetModel.from_pretrained("{controlnet_model}")')
-            print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
+            print("Next step: Run Stage 2 with pose conditioning:")
+            print("```bash")
+            print(f"python dreambooth_controlnet_stage2.py \\")
+            print(f"    --data_dir ./data_stage2 \\")
+            print(f"    --stage1_lora_path {output_dir} \\")
+            print(f"    --instance_prompt \"{instance_prompt}\" \\")
+            print(f"    --controlnet_model lllyasviel/control_v11p_sd15_openpose")
             print("```")
         else:
-            # Save the full pipeline with trained UNet
-            from diffusers import StableDiffusionControlNetPipeline
-            
-            pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-                pretrained_model,
-                unet=unwrapped_unet,
-                controlnet=controlnet,
-                text_encoder=text_encoder,
-                vae=vae,
-                tokenizer=tokenizer,
-                safety_checker=None,
-            )
-            pipeline.save_pretrained(output_dir)
-            print(f"✅ Full pipeline saved to: {output_dir}")
-            
-            # Also save just the UNet separately for easy loading
-            unwrapped_unet.save_pretrained(os.path.join(output_dir, "unet_trained"))
-            print(f"✅ Trained UNet also saved to: {output_dir}/unet_trained")
-            
-            print()
-            print("=" * 60)
-            print("✅ Training Complete!")
-            print("=" * 60)
-            print()
-            print("To use your trained model:")
-            print("```python")
-            print("from diffusers import StableDiffusionControlNetPipeline, ControlNetModel")
-            print(f'pipe = StableDiffusionControlNetPipeline.from_pretrained("{output_dir}")')
-            print(f'image = pipe("{instance_prompt}", image=conditioning_image).images[0]')
-            print("```")
+            unet_path = os.path.join(output_dir, "unet")
+            unwrapped_unet.save_pretrained(unet_path)
+            print(f"✅ UNet saved to: {unet_path}")
     
     accelerator.end_training()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DreamBooth + ControlNet (UNet Training Mode) - trains UNet for identity learning"
+        description="Stage 1: Appearance Control Pretraining (No ControlNet)"
     )
     
     # Data and output
     parser.add_argument("--data_dir", type=str, default="./data", help="Data directory")
-    parser.add_argument("--output_dir", type=str, default="./output/dreambooth-unet-controlnet")
+    parser.add_argument("--output_dir", type=str, default="./output/stage1-appearance")
     parser.add_argument("--pretrained_model", type=str, default="runwayml/stable-diffusion-v1-5")
-    parser.add_argument("--controlnet_model", type=str, default="lllyasviel/control_v11p_sd15_openpose",
-                       help="Pretrained ControlNet to use (frozen)")
     
     # DreamBooth parameters
-    parser.add_argument("--instance_prompt", type=str, default="a photo of sks cat",
+    parser.add_argument("--instance_prompt", type=str, default="a photo of sks person",
                        help="Prompt with rare identifier for the instance")
-    parser.add_argument("--class_prompt", type=str, default="a photo of cat",
+    parser.add_argument("--class_prompt", type=str, default="a photo of person",
                        help="General class prompt for prior preservation")
     parser.add_argument("--with_prior_preservation", action="store_true",
                        help="Enable prior preservation loss")
@@ -993,16 +778,15 @@ def main():
                        help="Weight of prior preservation loss")
     parser.add_argument("--num_class_images", type=int, default=100,
                        help="Number of class images for prior preservation")
-    parser.add_argument("--sample_batch_size", type=int, default=4,
-                       help="Batch size for class image generation")
     
     # Training parameters
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=5e-6,
-                       help="Learning rate (standard DreamBooth LR for UNet)")
-    parser.add_argument("--max_train_steps", type=int, default=800)
+                       help="Learning rate")
+    parser.add_argument("--max_train_steps", type=int, default=1000,
+                       help="Max training steps (more for Stage 1 since no pose guidance)")
     parser.add_argument("--checkpointing_steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--repeats", type=int, default=20,
@@ -1013,15 +797,15 @@ def main():
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--no_8bit_adam", action="store_true")
     parser.add_argument("--no_lora", action="store_true",
-                       help="Disable LoRA (full UNet fine-tuning, requires more VRAM)")
+                       help="Disable LoRA (full fine-tuning, requires more VRAM)")
     parser.add_argument("--lora_rank", type=int, default=4,
-                       help="LoRA rank (4-8 typical, higher = more params)")
+                       help="LoRA rank (4-8 typical)")
     parser.add_argument("--custom_diffusion_lora", action="store_true",
                        help="Use Custom Diffusion LoRA targets (attn2.to_k, attn2.to_v only)")
-    parser.add_argument("--train_text_encoder", action="store_true",
-                       help="Also train text encoder for stronger identity learning")
+    parser.add_argument("--no_train_text_encoder", action="store_true",
+                       help="Disable text encoder training (NOT recommended for Stage 1)")
     parser.add_argument("--augment_prompt_for_resize", action="store_true",
-                       help="Custom Diffusion: append ', very small' or ', zoomed in' to prompts for resized images")
+                       help="Custom Diffusion: augment prompts for resized images")
     
     args = parser.parse_args()
     
@@ -1029,13 +813,11 @@ def main():
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         pretrained_model=args.pretrained_model,
-        controlnet_model=args.controlnet_model,
         instance_prompt=args.instance_prompt,
         class_prompt=args.class_prompt,
         with_prior_preservation=args.with_prior_preservation,
         prior_loss_weight=args.prior_loss_weight,
         num_class_images=args.num_class_images,
-        sample_batch_size=args.sample_batch_size,
         resolution=args.resolution,
         train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -1048,7 +830,7 @@ def main():
         use_lora=not args.no_lora,
         lora_rank=args.lora_rank,
         custom_diffusion_lora=args.custom_diffusion_lora,
-        train_text_encoder=args.train_text_encoder,
+        train_text_encoder=not args.no_train_text_encoder,  # ENABLED by default
         augment_prompt_for_resize=args.augment_prompt_for_resize,
         seed=args.seed,
         repeats=args.repeats,
