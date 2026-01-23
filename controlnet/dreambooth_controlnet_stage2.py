@@ -545,11 +545,8 @@ def train(
     if stage1_lora_path and os.path.exists(os.path.join(stage1_lora_path, "unet_lora")):
         unet_lora_path = os.path.join(stage1_lora_path, "unet_lora")
         print(f"   🔄 Loading Stage 1 UNet LoRA from {unet_lora_path}")
-        unet = PeftModel.from_pretrained(unet, unet_lora_path)
+        unet = PeftModel.from_pretrained(unet, unet_lora_path, is_trainable=True)
         
-        # Unfreeze for continued training
-        for param in unet.parameters():
-            param.requires_grad = True
         unet.print_trainable_parameters()
         print("   ✅ UNet loaded with Stage 1 LoRA (TRAINABLE)")
     elif use_lora:
