@@ -46,7 +46,7 @@ NUM_IMAGES=$(ls instance_images/*.{jpg,jpeg,png,JPG,JPEG,PNG} 2>/dev/null | wc -
 echo "Found $NUM_IMAGES training images"
 
 # Multi-GPU optimized settings
-INSTANCE_PROMPT="${INSTANCE_PROMPT:-a photo of sks person}"
+INSTANCE_PROMPT="${INSTANCE_PROMPT:-a sks humanoid robot}"
 CLASS_PROMPT="${CLASS_PROMPT:-a photo of person}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/dreambooth-model}"
 LEARNING_RATE="${LEARNING_RATE:-2e-6}"

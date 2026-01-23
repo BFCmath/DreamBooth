@@ -373,6 +373,7 @@ def train(
     pretrained_model: str = "runwayml/stable-diffusion-v1-5",
     controlnet_model: str = "lllyasviel/control_v11p_sd15_openpose",
     stage1_lora_path: str = None,  # Path to Stage 1 trained LoRA
+    token_embedding_path: str = None,  # Path to token_embedding.pt from Stage 1
     # DreamBooth-specific parameters
     instance_prompt: str = "a sks humanoid robot",
     class_prompt: str = "a photo of person",
@@ -394,7 +395,7 @@ def train(
     use_lora: bool = True,
     lora_rank: int = 4,
     custom_diffusion_lora: bool = False,
-    train_text_encoder: bool = True,  # Continue training text encoder
+    train_text_encoder: bool = False,  # Text encoder frozen by default (use --train_text_encoder to enable)
     train_controlnet: bool = True,  # Train ControlNet (Stage 2 key feature!)
     augment_prompt_for_resize: bool = False,
     seed: int = 42,
@@ -523,6 +524,14 @@ def train(
         text_encoder.requires_grad_(False)
         text_encoder.to(device, dtype=weight_dtype)
         print("   ✅ Text encoder loaded (frozen)")
+    
+    # Load token embedding if provided (from Stage 1 --train_token_embedding)
+    if token_embedding_path and os.path.exists(token_embedding_path):
+        token_data = torch.load(token_embedding_path, map_location="cpu")
+        placeholder_token_id = token_data["token_id"]
+        embedding = token_data["embedding"]
+        text_encoder.text_model.embeddings.token_embedding.weight.data[placeholder_token_id] = embedding.to(device)
+        print(f"   ✅ Loaded token embedding for '{token_data['token']}' (ID: {placeholder_token_id})")
     
     # VAE (frozen)
     vae = AutoencoderKL.from_pretrained(pretrained_model, subfolder="vae")
@@ -928,6 +937,8 @@ def main():
                        help="Pretrained ControlNet to start from")
     parser.add_argument("--stage1_lora_path", type=str, default=None,
                        help="Path to Stage 1 trained LoRA weights (contains unet_lora/ and text_encoder_lora/)")
+    parser.add_argument("--token_embedding_path", type=str, default=None,
+                       help="Path to token_embedding.pt from Stage 1 training")
     
     # DreamBooth parameters
     parser.add_argument("--instance_prompt", type=str, default="a sks humanoid robot",
@@ -968,8 +979,8 @@ def main():
                        help="LoRA rank")
     parser.add_argument("--custom_diffusion_lora", action="store_true",
                        help="Use Custom Diffusion LoRA targets")
-    parser.add_argument("--no_train_text_encoder", action="store_true",
-                       help="Disable text encoder training")
+    parser.add_argument("--train_text_encoder", action="store_true",
+                       help="Also train text encoder (not recommended if using token embedding)")
     parser.add_argument("--no_train_controlnet", action="store_true",
                        help="Freeze ControlNet (NOT recommended for Stage 2)")
     parser.add_argument("--augment_prompt_for_resize", action="store_true",
@@ -983,6 +994,7 @@ def main():
         pretrained_model=args.pretrained_model,
         controlnet_model=args.controlnet_model,
         stage1_lora_path=args.stage1_lora_path,
+        token_embedding_path=args.token_embedding_path,
         instance_prompt=args.instance_prompt,
         class_prompt=args.class_prompt,
         with_prior_preservation=args.with_prior_preservation,
@@ -1002,7 +1014,7 @@ def main():
         use_lora=not args.no_lora,
         lora_rank=args.lora_rank,
         custom_diffusion_lora=args.custom_diffusion_lora,
-        train_text_encoder=not args.no_train_text_encoder,
+        train_text_encoder=args.train_text_encoder,
         train_controlnet=not args.no_train_controlnet,
         augment_prompt_for_resize=args.augment_prompt_for_resize,
         seed=args.seed,

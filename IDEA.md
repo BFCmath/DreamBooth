@@ -1,3 +1,8 @@
+# https://arxiv.org/pdf/2212.04488v2
+In Custom Diffusion, the text encoder is frozen.
+Only:
+- Cross-attention key/value projection matrices in the U-Net, and
+- The embedding of the new modifier token (e.g., V*)
 # https://arxiv.org/pdf/2311.12052
 #### Stage 1: Appearance Control Pretraining
 *   **Goal:** Teach the Appearance Model how to inject identity features via the MSSA module.

@@ -12,9 +12,9 @@ import os
 # Configuration
 MODEL_PATH = "./output/dreambooth-model"
 PROMPTS = [
-    "a photo of sks person",
-    "a photo of sks person in a suit",
-    "a photo of sks person at the beach",
+    "a sks humanoid robot",
+    "a sks humanoid robot in a suit",
+    "a sks humanoid robot at the beach",
     "oil painting of sks person",
     "sks person as a superhero",
 ]
