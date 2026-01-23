@@ -397,6 +397,7 @@ def train(
     custom_diffusion_lora: bool = False,
     train_text_encoder: bool = False,  # Text encoder frozen by default (use --train_text_encoder to enable)
     train_controlnet: bool = True,  # Train ControlNet (Stage 2 key feature!)
+    controlnet_lora: bool = False,  # Train ControlNet with LoRA
     augment_prompt_for_resize: bool = False,
     seed: int = 42,
     repeats: int = 20,
@@ -426,6 +427,7 @@ def train(
     print(f"  Class prompt: {class_prompt}")
     print(f"  Prior preservation: {with_prior_preservation}")
     print(f"  Train ControlNet: {train_controlnet}")
+    print(f"  ControlNet LoRA: {controlnet_lora}")
     print(f"  Train text encoder: {train_text_encoder}")
     print()
     print("Training Configuration:")
@@ -574,17 +576,35 @@ def train(
     controlnet = ControlNetModel.from_pretrained(controlnet_model)
     
     if train_controlnet:
-        # Keep ControlNet trainable  
-        controlnet.requires_grad_(True)
-        print(f"   ✅ ControlNet loaded from {controlnet_model} (TRAINABLE)")
+        if controlnet_lora:
+            print(f"   🔧 Applying LoRA to ControlNet with rank={lora_rank}")
+            # Target standard attention layers in ControlNet
+            controlnet_lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_rank,
+                init_lora_weights="gaussian",
+                target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            )
+            controlnet = get_peft_model(controlnet, controlnet_lora_config)
+            controlnet.print_trainable_parameters()
+            print("   ✅ ControlNet loaded with LoRA (TRAINABLE)")
+            
+            # Count trainable params for logging
+            controlnet_params = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
+        else:
+            # Keep ControlNet fully trainable  
+            controlnet.requires_grad_(True)
+            print(f"   ✅ ControlNet loaded from {controlnet_model} (TRAINABLE - Full)")
+            
+            # Count trainable params
+            controlnet_params = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
         
-        # Count trainable params
-        controlnet_params = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
         print(f"   📊 ControlNet trainable parameters: {controlnet_params:,}")
     else:
         controlnet.requires_grad_(False)
         controlnet.to(device, dtype=weight_dtype)
         print(f"   ✅ ControlNet loaded from {controlnet_model} (frozen)")
+
     
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model, subfolder="scheduler")
@@ -980,6 +1000,8 @@ def main():
                        help="Also train text encoder (not recommended if using token embedding)")
     parser.add_argument("--no_train_controlnet", action="store_true",
                        help="Freeze ControlNet (NOT recommended for Stage 2)")
+    parser.add_argument("--controlnet_lora", action="store_true",
+                       help="Train ControlNet with LoRA (efficient fine-tuning)")
     parser.add_argument("--augment_prompt_for_resize", action="store_true",
                        help="Custom Diffusion: augment prompts for resized images")
     
@@ -1013,6 +1035,7 @@ def main():
         custom_diffusion_lora=args.custom_diffusion_lora,
         train_text_encoder=args.train_text_encoder,
         train_controlnet=not args.no_train_controlnet,
+        controlnet_lora=args.controlnet_lora,
         augment_prompt_for_resize=args.augment_prompt_for_resize,
         seed=args.seed,
         repeats=args.repeats,
