@@ -49,6 +49,7 @@ def generate_images(
     output_dir: str = "./output_images",
     model_path: str = "runwayml/stable-diffusion-v1-5",
     controlnet_model: str = "lllyasviel/control_v11p_sd15_canny",
+    base_controlnet_model: str = None,  # Base ControlNet model for LoRA loading
     detector_type: str = "auto",  # auto, canny, hed, openpose, none
     num_images: int = 1,
     num_inference_steps: int = 30,
@@ -201,11 +202,47 @@ def generate_images(
     # STEP 2: Load ControlNet and SD Pipeline
     # =========================================
     print(f"⏳ Loading ControlNet: {controlnet_model}")
-    controlnet = ControlNetModel.from_pretrained(
-        controlnet_model,
-        torch_dtype=dtype,
-    )
-    print("✅ ControlNet loaded!")
+    
+    # Check if controlnet_model is a full model or LoRA weights
+    controlnet_path = Path(controlnet_model)
+    config_exists = (controlnet_path / "config.json").exists() if controlnet_path.exists() else False
+    
+    if not config_exists and controlnet_path.exists():
+        # This is likely a LoRA adapter directory - need to load base model first
+        # Try to infer the base model from the adapter
+        adapter_config_path = controlnet_path / "adapter_config.json"
+        
+        if adapter_config_path.exists():
+            print(f"   🔍 Detected LoRA adapter at {controlnet_model}")
+            # Try to extract base model from adapter config
+            import json
+            with open(adapter_config_path, "r") as f:
+                adapter_config = json.load(f)
+            
+            # Use explicit base model if provided, otherwise use default
+            base_controlnet = base_controlnet_model or "lllyasviel/control_v11p_sd15_openpose"
+            print(f"   ⏳ Loading base ControlNet: {base_controlnet}")
+            
+            from peft import PeftModel
+            controlnet = ControlNetModel.from_pretrained(
+                base_controlnet,
+                torch_dtype=dtype,
+            )
+            print(f"   ⏳ Applying LoRA weights from: {controlnet_model}")
+            controlnet = PeftModel.from_pretrained(controlnet, str(controlnet_path))
+            print("   ✅ ControlNet LoRA weights applied!")
+        else:
+            raise ValueError(
+                f"ControlNet path {controlnet_model} exists but has no config.json or adapter_config.json. "
+                "Cannot determine if this is a full model or LoRA adapter."
+            )
+    else:
+        # Standard loading (either HuggingFace model or full saved model)
+        controlnet = ControlNetModel.from_pretrained(
+            controlnet_model,
+            torch_dtype=dtype,
+        )
+        print("✅ ControlNet loaded!")
     
     # Load pipeline
     print(f"⏳ Loading Stable Diffusion pipeline: {model_path}")
@@ -457,7 +494,13 @@ def main():
         "--controlnet_model",
         type=str,
         default="lllyasviel/control_v11p_sd15_openpose",
-        help="ControlNet model for pose conditioning",
+        help="ControlNet model for pose conditioning (can be full model or LoRA weights path)",
+    )
+    parser.add_argument(
+        "--base_controlnet_model",
+        type=str,
+        default=None,
+        help="Base ControlNet model to use when loading LoRA weights (e.g., lllyasviel/control_v11p_sd15_openpose)",
     )
     parser.add_argument(
         "--num_images",
@@ -546,6 +589,7 @@ def main():
         output_dir=args.output_dir,
         model_path=args.model_path,
         controlnet_model=args.controlnet_model,
+        base_controlnet_model=args.base_controlnet_model,
         detector_type=args.detector,
         num_images=args.num_images,
         num_inference_steps=args.num_inference_steps,
