@@ -229,8 +229,11 @@ def generate_images(
                 torch_dtype=dtype,
             )
             print(f"   ⏳ Applying LoRA weights from: {controlnet_model}")
-            controlnet = PeftModel.from_pretrained(controlnet, str(controlnet_path))
-            print("   ✅ ControlNet LoRA weights applied!")
+            controlnet_peft = PeftModel.from_pretrained(controlnet, str(controlnet_path))
+            # Merge LoRA weights into base model for pipeline compatibility
+            print("   🔄 Merging LoRA weights into base model...")
+            controlnet = controlnet_peft.merge_and_unload()
+            print("   ✅ ControlNet LoRA weights merged!")
         else:
             raise ValueError(
                 f"ControlNet path {controlnet_model} exists but has no config.json or adapter_config.json. "
