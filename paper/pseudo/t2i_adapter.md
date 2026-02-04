@@ -1,82 +1,97 @@
-# T2I-Adapter Training Pseudo-code
+# T2I-Adapter: Architectural and Training Pseudocode
 
-### 1. Ý tưởng cốt lõi: Lightweight Adapter
-T2I-Adapter là một mạng cực kỳ nhỏ (~77M tham số) tách biệt hoàn toàn với UNet gốc. 
-- **Mục tiêu:** "Căn chỉnh" (align) thông tin điều kiện bên ngoài với kiến thức bên trong model SD.
-- **Vị trí tác động:** Chỉ thêm vào nhánh **Encoder** của UNet.
+## 1. Core Concept: Lightweight Adapters
+T2I-Adapter is a highly efficient, lightweight plugin (~77M parameters) designed to align external control information with the internal knowledge of a pre-trained Stable Diffusion model.
 
-### 2. Chi tiết kiến trúc Adapter
+*   **Objective:** To provide spatial guidance (e.g., sketches, depth, or pose) without modifying the original U-Net weights.
+*   **Integration Point:** Features are injected exclusively into the **Encoder** blocks of the U-Net.
+
+---
+
+## 2. Architectural Implementation
+The following pseudocode details the Adapter's structure and its integration into the diffusion forward pass.
+
 ```python
-# --- KIẾN TRÚC ADAPTER (ℱ_AD) ---
-def T2I_Adapter(condition_img):
-    # condition_img: 512x512
+# --- T2I-Adapter Architecture (ℱ_AD) ---
+def T2I_Adapter(condition_map):
+    # Input: High-resolution condition (e.g., 512x512)
     
-    # 1. Downsample ban đầu bằng Pixel Unshuffle
-    x = PixelUnshuffle(condition_img) # -> 64x64
+    # 1. Initial spatial compression via Pixel Unshuffle
+    x = PixelUnshuffle(condition_map) # -> Latent resolution (e.g., 64x64)
     
     features = []
-    # 2. Qua 4 level độ phân giải (64x64, 32x32, 16x16, 8x8)
+    # 2. Multi-scale feature extraction (Scales: 64x64, 32x32, 16x16, 8x8)
     for scale in range(4):
         x = Conv2D(x)
         x = ResBlock(x)
         x = ResBlock(x)
         features.append(x)
         
-        if scale < 3: # Downsample cho level tiếp theo
+        if scale < 3: # Downsample for the subsequent level
             x = Downsample(x)
             
-    return features # Trả về 4 feature maps tương ứng 4 level của UNet Encoder
+    return features # Returns 4 scale-specific control features
 
-# --- QUÁ TRÌNH FORWARD ---
-def forward(z_t, t, prompt_embeds, condition_img):
-    # Trích xuất đặc trưng từ Adapter (Chỉ chạy 1 lần nếu condition không đổi)
-    adapter_feats = T2I_Adapter(condition_img)
+# --- Combined Forward Pass ---
+def forward(z_t, t, prompt_embeds, condition_map):
+    # Extract features from the Lightweight Adapter
+    # Optimization: This can be computed once if the condition is constant.
+    adapter_feats = T2I_Adapter(condition_map)
     
-    # UNet Encoder: Cộng trực tiếp các đặc trưng từ adapter
-    # i đại diện cho 4 scale: 64x64, 32x32, 16x16, 8x8
+    # U-Net Encoder: Direct additive injection of adapter features
+    # Each adapter feature is added to the corresponding U-Net scale.
     x = z_t
+    scale_idx = 0
     for i, block in enumerate(sd_unet.encoder):
         x = block(x, t, prompt_embeds)
-        if i in injection_indices: # Tại mỗi scale của encoder
+        if i in injection_indices: # Matching U-Net and Adapter scales
             x = x + adapter_feats[scale_idx]
             scale_idx += 1
             
-    # UNet Middle & Decoder chạy bình thường (không có can thiệp thêm)
+    # U-Net Middle and Decoder blocks proceed without further modification
     noise_pred = sd_unet.middle_and_decoder(x, t, prompt_embeds)
     
     return noise_pred
 ```
 
-### 3. Training Loop & Chiến thuật Cubic Sampling
+---
+
+## 3. Training Strategy and Cubic Sampling
+T2I-Adapter utilizes **Cubic Sampling** during training to prioritize learning structural alignment during the early stages of the diffusion process (where noise is high).
+
 ```python
-# T2I-Adapter dùng Cubic Sampling để model tập trung học cấu trúc ở các bước nhiễu nặng
+# Cubic Sampling favors larger values of 't' (early diffusion stages)
 def cubic_sample_t():
     u = Uniform(0, 1)
-    t = (1 - u**3) * T # Hàm bậc 3 giúp lấy t lớn (early stages) nhiều hơn
+    t = (1 - u**3) * T 
     return t
 
+# --- Training Loop ---
 for x0, p, condition in dataloader:
     z0 = VAE.encode(x0)
     ε  = N(0, I)
-    t  = cubic_sample_t() # Điểm khác biệt quan trọng
+    t  = cubic_sample_t() # Strategic timestep selection
     z_t = add_noise(z0, ε, t)
     
     c_t = TextEncoder(p)
     
-    # Forward & Loss
+    # Objective Calculation
     ε_pred = forward(z_t, t, c_t, condition)
     loss = ||ε_pred - ε||²
     
-    # CHỈ update T2I-Adapter, SD_UNet bị đóng băng hoàn toàn
+    # Optimization: Update ONLY the T2I-Adapter. SD U-Net is frozen.
     opt.zero_grad()
     loss.backward()
     opt.step()
 ```
 
-### 4. So sánh nhanh với ControlNet:
-| Đặc điểm | ControlNet | T2I-Adapter |
-| :--- | :--- | :--- |
-| **Kích thước** | Lớn (bằng cả Encoder UNet) | Rất nhỏ (~77M params) |
-| **Vị trí Inject** | Decoder (Skip-connections) | Encoder |
-| **Kết nối** | Zero Convolution | Cộng trực tiếp |
-| **Inference** | Phải chạy ControlNet mỗi bước `t` | Có thể trích xuất feature 1 lần duy nhất |
+---
+
+## 4. Architectural Comparison: ControlNet vs. T2I-Adapter
+
+| Feature                  | ControlNet                                  | T2I-Adapter                        |
+| :----------------------- | :------------------------------------------ | :--------------------------------- |
+| **Parameter Size**       | Large (comparable to U-Net Encoder)         | Very Small (~77M parameters)       |
+| **Injection Point**      | Decoder (via Skip-connections)              | Encoder Blocks                     |
+| **Connection Type**      | Zero-Convolution Residuals                  | Direct Feature Addition            |
+| **Inference Efficiency** | Requires ControlNet pass for every step `t` | Features can be pre-extracted once |

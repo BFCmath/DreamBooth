@@ -1,44 +1,49 @@
-# HyperHuman Stage 2: Training Pseudo-code (PPDM Style)
+# HyperHuman Stage 2: Structure-Guided Refiner Pseudocode
+
+The second stage utilizes a pre-trained SDXL backbone to render high-resolution (1024x1024) images, guided by the structural maps generated in Stage 1.
 
 ---
 
-### Training Pipeline (Stage 2: Structure-Guided Refiner)
-**Mục tiêu:** Fine-tune SDXL để render ảnh 1024x1024 cực nét dựa trên khung cấu trúc.
+## 1. Training Pipeline: High-Resolution Refinement
+The goal is to fine-tune the model to utilize multi-modal structural guidance (Depth, Normal, and Pose) for hyper-realistic human synthesis.
 
 ```python
-# 1. High-Res Input Sampling
-x_high, c, d, n, p ~ HighRes_Human_Dataset # 1024x1024
+# --- 1. High-Resolution Input Sampling ---
+# x_high: 1024x1024 RGB image, d, n, p: Ground truth structural maps
+x_high, c, d, n, p ~ HighRes_Human_Dataset 
 
-# 2. Latent Encoding (SDXL VAE)
+# --- 2. Latent Encoding (SDXL VAE) ---
 z0 = VAE_XL.encode(x_high)
 cond_text = TextEncoder_XL(c)
 
-# 3. Robust Conditioning (Random Dropout)
-# Giúp model không bị "lệch tủ" nếu G1 dự đoán Depth/Normal hơi lỗi
+# --- 3. Robust Conditioning (Structural Dropout) ---
+# Training with random dropout makes the refiner resilient to potential
+# prediction errors from the Stage 1 structural model.
 if random < 0.15: cond_text = ""
 if random < 0.5:  d, n, p = zeros()
 
-# 4. Structure Encoding (ConditionEncoder)
-# 4 Conv layers (4x4, stride 2, ReLU) cho từng loại
-f_d = CondEncoder_D(d) # 1024 -> 128
+# --- 4. Structure Encoding (ConditionEncoder) ---
+# Employs 4 convolutional layers (4x4 kernels, stride 2, ReLU) for each modality
+f_d = CondEncoder_D(d) # Downsample 1024 -> 128 (latent resolution)
 f_n = CondEncoder_N(n)
 f_p = CondEncoder_P(p)
 
-# 5. Fusion: Coordinate-wise Summation
-# Nén 3 loại cấu trúc thành 1 tín hiệu điều khiển duy nhất
+# --- 5. Fusion: Coordinate-wise Summation ---
+# Condenses disparate structural signals into a unified control embedding
 f_cond = f_d + f_n + f_p
 
-# 6. Diffusion Parameters
+# --- 6. Diffusion Parameters ---
 t ~ Uniform(0, T)
 ε ~ N(0, I)
 z_t = q_sample(z0, t, ε)
 
-# 7. Model Forward Pass (Frozen SDXL + Trainable Copies)
-# f_cond được nạp vào các bản sao (Trainable copies) của SDXL Encoder
+# --- 7. Model Forward Pass (Frozen SDXL + Trainable Branch) ---
+# f_cond is injected into trainable clones of the SDXL Encoder blocks
 ε_hat = SDXL_Refiner(z_t, t, cond_text, f_cond)
 
-# 8. Loss & Optimization
-# CHỈ update Trainable Copies và CondEncoders. Frozen SDXL backbone.
+# --- 8. Optimization Strategy ---
+# Only the Trainable Branch and ConditionEncoders are updated.
+# The SDXL backbone remains frozen to preserve large-scale generative knowledge.
 loss = ||ε_hat - ε||²
 
 opt.zero_grad()
@@ -48,18 +53,21 @@ opt.step()
 
 ---
 
-### Inference (Lúc sử dụng)
+## 2. Inference: Sequential Generation
+The finalized generation process cascades the structural predictions from Stage 1 into the high-resolution refiner.
+
 ```python
-# 1. Lấy cấu trúc từ Stage 1
-# Input: User_Prompt, User_Pose
+# --- Step 1: Generate structural maps via Stage 1 Model ---
+# Input: User-defined Prompt and Pose
 _, d_hat, n_hat = Stage1_Model(User_Prompt, User_Pose)
 
-# 2. Render ảnh nét cao ở Stage 2
-# Input: User_Prompt, User_Pose, d_hat, n_hat
+# --- Step 2: High-Resolution Rendering via Stage 2 Model ---
+# Input: User_Prompt, User_Pose, and predicted d_hat, n_hat
 t_steps = T ... 0
 z_t = N(0, I)
 
 for t in t_steps:
+    # Combine user pose with predicted depth and normal maps
     f_cond = CondEncoder(User_Pose) + CondEncoder(d_hat) + CondEncoder(n_hat)
     ε_hat = SDXL_Refiner(z_t, t, TextEncoder(User_Prompt), f_cond)
     z_t = step(z_t, ε_hat, t)
